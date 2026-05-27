@@ -56,6 +56,7 @@ import type {
   GenerationResult,
   GenerationCallbacks,
 } from './pipeline-types';
+import type { ThinkingConfig } from '@/lib/types/provider';
 import { createLogger } from '@/lib/logger';
 const log = createLogger('Generation');
 
@@ -69,6 +70,7 @@ export interface SceneContentOptions {
   generatedMediaMapping?: ImageMapping;
   agents?: AgentInfo[];
   languageDirective?: string;
+  thinkingConfig?: ThinkingConfig;
 }
 
 export interface SceneActionsOptions {
@@ -290,6 +292,7 @@ export async function generateSceneContent(
     generatedMediaMapping,
     agents,
     languageDirective,
+    thinkingConfig,
   } = options;
 
   // Unified path for interactive scenes (both normal and ultra mode)
@@ -331,7 +334,7 @@ export async function generateSceneContent(
     case 'quiz':
       return generateQuizContent(outline, aiCall, languageDirective);
     case 'pbl':
-      return generatePBLSceneContent(outline, languageModel, languageDirective);
+      return generatePBLSceneContent(outline, languageModel, languageDirective, thinkingConfig);
     default:
       return null;
   }
@@ -415,7 +418,8 @@ function resolveImageIds(
       }
 
       if (el.type === 'video') {
-        if (!('src' in el)) {
+        const mediaRef = (el as Record<string, unknown>).mediaRef;
+        if (!('src' in el) && typeof mediaRef !== 'string') {
           log.warn(`Video element missing src, removing element`);
           return null;
         }
@@ -429,6 +433,60 @@ function resolveImageIds(
           log.debug(`Keeping generated video placeholder: ${src}`);
           return el;
         }
+      }
+
+      return el;
+    })
+    .filter((el): el is NonNullable<typeof el> => el !== null);
+}
+
+function normalizeGeneratedVideoRefs(
+  elements: GeneratedSlideData['elements'],
+  generatedVideoEntries: SceneOutline['mediaGenerations'] = [],
+): GeneratedSlideData['elements'] {
+  const validRefs = generatedVideoEntries
+    .filter((mg) => mg.type === 'video')
+    .map((mg) => mg.elementId);
+
+  const validRefSet = new Set(validRefs);
+  const onlyRef = validRefs.length === 1 ? validRefs[0] : undefined;
+
+  return elements
+    .map((el) => {
+      if (el.type !== 'video') return el;
+
+      const videoEl = { ...el } as Record<string, unknown>;
+      const mediaRef = typeof videoEl.mediaRef === 'string' ? videoEl.mediaRef : undefined;
+      const src = typeof videoEl.src === 'string' ? videoEl.src : undefined;
+      const hasGeneratedSrc = !!src && isGeneratedImageId(src);
+      const hasDirectSrc = !!src && !hasGeneratedSrc;
+
+      if (hasDirectSrc) {
+        if (mediaRef) delete videoEl.mediaRef;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef && validRefSet.has(mediaRef)) {
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (src && validRefSet.has(src)) {
+        videoEl.mediaRef = src;
+        delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if ((mediaRef || hasGeneratedSrc) && onlyRef) {
+        log.warn(`Correcting generated video reference "${mediaRef || src}" to "${onlyRef}"`);
+        videoEl.mediaRef = onlyRef;
+        if (hasGeneratedSrc) delete videoEl.src;
+        return videoEl as typeof el;
+      }
+
+      if (mediaRef || hasGeneratedSrc) {
+        log.warn(`Invalid generated video reference "${mediaRef || src}", removing element`);
+        return null;
       }
 
       return el;
@@ -633,14 +691,20 @@ async function generateSlideContent(
     }
   }
 
+  const generatedImageEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'image') ?? [];
+  const generatedVideoEntries = outline.mediaGenerations?.filter((mg) => mg.type === 'video') ?? [];
+  const hasAssignedImages = (assignedImages?.length ?? 0) > 0;
+  const generatedImageEnabled = generatedImageEntries.length > 0;
+  const generatedVideoEnabled = generatedVideoEntries.length > 0;
+  const imageElementEnabled = hasAssignedImages || generatedImageEnabled;
+  const mediaElementEnabled = imageElementEnabled || generatedVideoEnabled;
+
   // Add generated media placeholders info (images + videos)
   if (outline.mediaGenerations && outline.mediaGenerations.length > 0) {
-    const genImgDescs = outline.mediaGenerations
-      .filter((mg) => mg.type === 'image')
+    const genImgDescs = generatedImageEntries
       .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
       .join('\n');
-    const genVidDescs = outline.mediaGenerations
-      .filter((mg) => mg.type === 'video')
+    const genVidDescs = generatedVideoEntries
       .map((mg) => `- ${mg.elementId}: "${mg.prompt}" (aspect ratio: ${mg.aspectRatio || '16:9'})`)
       .join('\n');
 
@@ -649,7 +713,9 @@ async function generateSlideContent(
       mediaParts.push(`AI-Generated Images (use these IDs as image element src):\n${genImgDescs}`);
     }
     if (genVidDescs) {
-      mediaParts.push(`AI-Generated Videos (use these IDs as video element src):\n${genVidDescs}`);
+      mediaParts.push(
+        `AI-Generated Videos (use these IDs as video element mediaRef):\n${genVidDescs}`,
+      );
     }
 
     if (mediaParts.length > 0) {
@@ -678,6 +744,10 @@ async function generateSlideContent(
     canvas_height: canvasHeight,
     teacherContext,
     languageDirective: languageDirective || '',
+    imageElementEnabled,
+    generatedImageEnabled,
+    generatedVideoEnabled,
+    mediaElementEnabled,
   });
 
   if (!prompts) {
@@ -733,8 +803,14 @@ async function generateSlideContent(
   );
   log.debug(`After image resolution: ${resolvedElements.length} elements`);
 
+  const videoNormalizedElements = normalizeGeneratedVideoRefs(
+    resolvedElements,
+    outline.mediaGenerations,
+  );
+  log.debug(`After video reference normalization: ${videoNormalizedElements.length} elements`);
+
   // Process elements, assign unique IDs
-  const processedElements: PPTElement[] = resolvedElements.map((el) => ({
+  const processedElements: PPTElement[] = videoNormalizedElements.map((el) => ({
     ...el,
     id: `${el.type}_${nanoid(8)}`,
     rotate: 0,
@@ -870,6 +946,7 @@ async function generatePBLSceneContent(
   outline: SceneOutline,
   languageModel?: LanguageModel,
   languageDirective?: string,
+  thinkingConfig?: ThinkingConfig,
 ): Promise<GeneratedPBLContent | null> {
   if (!languageModel) {
     log.error('LanguageModel required for PBL generation');
@@ -897,6 +974,7 @@ async function generatePBLSceneContent(
       {
         onProgress: (msg) => log.info(`${msg}`),
       },
+      thinkingConfig,
     );
     log.info(
       `PBL generated: ${projectConfig.agents.length} agents, ${projectConfig.issueboard.issues.length} issues`,
