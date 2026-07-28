@@ -25,7 +25,9 @@ export function WebSearchSettings({ selectedProviderId }: WebSearchSettingsProps
 
   const provider = WEB_SEARCH_PROVIDERS[selectedProviderId];
   const isServerConfigured = !!webSearchProvidersConfig[selectedProviderId]?.isServerConfigured;
-  const showCredentialFields = true;
+  const isOperatorManagedBaseUrl = selectedProviderId === 'searxng';
+  // Managed providers are admin-owned: hide the key/base-URL override inputs.
+  const showCredentialFields = !isServerConfigured && !isOperatorManagedBaseUrl;
 
   const buildRequestUrl = (baseUrl: string) => {
     const trimmed = baseUrl.replace(/\/$/, '');
@@ -50,7 +52,13 @@ export function WebSearchSettings({ selectedProviderId }: WebSearchSettingsProps
         </div>
       )}
 
-      {!provider.requiresApiKey && !isServerConfigured && (
+      {isOperatorManagedBaseUrl && !isServerConfigured && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30 p-3 text-sm text-amber-700 dark:text-amber-300">
+          {t('settings.searxngServerOnlyNotice')}
+        </div>
+      )}
+
+      {!provider.requiresApiKey && !isServerConfigured && !isOperatorManagedBaseUrl && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30 p-3 text-sm text-amber-700 dark:text-amber-300">
           {t('settings.webSearchApiKeyOptional')}
         </div>
@@ -71,11 +79,9 @@ export function WebSearchSettings({ selectedProviderId }: WebSearchSettingsProps
                   autoCorrect="off"
                   spellCheck={false}
                   placeholder={
-                    isServerConfigured
+                    !provider.requiresApiKey
                       ? t('settings.optionalOverride')
-                      : !provider.requiresApiKey
-                        ? t('settings.optionalOverride')
-                        : t('settings.enterApiKey')
+                      : t('settings.enterApiKey')
                   }
                   value={webSearchProvidersConfig[selectedProviderId]?.apiKey || ''}
                   onChange={(e) =>

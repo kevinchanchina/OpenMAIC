@@ -4,6 +4,9 @@ const searchWithBochaMock = vi.hoisted(() => vi.fn());
 const searchWithBraveMock = vi.hoisted(() => vi.fn());
 const searchWithBaiduMock = vi.hoisted(() => vi.fn());
 const searchWithTavilyMock = vi.hoisted(() => vi.fn());
+const searchWithMiniMaxMock = vi.hoisted(() => vi.fn());
+const searchWithDoubaoMock = vi.hoisted(() => vi.fn());
+const searchWithSearxngMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/web-search/bocha', () => ({
   searchWithBocha: searchWithBochaMock,
@@ -21,6 +24,18 @@ vi.mock('@/lib/web-search/tavily', () => ({
   searchWithTavily: searchWithTavilyMock,
 }));
 
+vi.mock('@/lib/web-search/minimax', () => ({
+  searchWithMiniMax: searchWithMiniMaxMock,
+}));
+
+vi.mock('@/lib/web-search/doubao', () => ({
+  searchWithDoubao: searchWithDoubaoMock,
+}));
+
+vi.mock('@/lib/web-search/searxng', () => ({
+  searchWithSearxng: searchWithSearxngMock,
+}));
+
 import { searchWeb } from '@/lib/web-search';
 
 describe('searchWeb', () => {
@@ -29,6 +44,9 @@ describe('searchWeb', () => {
     searchWithBraveMock.mockReset();
     searchWithBaiduMock.mockReset();
     searchWithTavilyMock.mockReset();
+    searchWithMiniMaxMock.mockReset();
+    searchWithDoubaoMock.mockReset();
+    searchWithSearxngMock.mockReset();
   });
 
   it('dispatches Tavily provider requests', async () => {
@@ -133,6 +151,95 @@ describe('searchWeb', () => {
       maxResults: undefined,
       baseUrl: undefined,
       subSources: { webSearch: false, baike: true, scholar: false },
+    });
+  });
+
+  it('dispatches MiniMax provider requests', async () => {
+    searchWithMiniMaxMock.mockResolvedValueOnce({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.5,
+    });
+
+    await expect(
+      searchWeb({
+        providerId: 'minimax',
+        query: 'q',
+        apiKey: 'minimax-key',
+        maxResults: 5,
+        baseUrl: 'https://api.minimaxi.com',
+      }),
+    ).resolves.toEqual({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.5,
+    });
+    expect(searchWithMiniMaxMock).toHaveBeenCalledWith({
+      query: 'q',
+      apiKey: 'minimax-key',
+      maxResults: 5,
+      baseUrl: 'https://api.minimaxi.com',
+    });
+  });
+
+  it('dispatches Doubao provider requests', async () => {
+    searchWithDoubaoMock.mockResolvedValueOnce({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.6,
+    });
+
+    await expect(
+      searchWeb({
+        providerId: 'doubao',
+        query: 'q',
+        apiKey: 'ark-key',
+        maxResults: 10,
+        baseUrl: 'https://open.feedcoopapi.com',
+      }),
+    ).resolves.toEqual({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.6,
+    });
+    expect(searchWithDoubaoMock).toHaveBeenCalledWith({
+      query: 'q',
+      apiKey: 'ark-key',
+      maxResults: 10,
+      baseUrl: 'https://open.feedcoopapi.com',
+    });
+    expect(searchWithMiniMaxMock).not.toHaveBeenCalled();
+  });
+
+  it('dispatches SearXNG provider requests with base URL only', async () => {
+    searchWithSearxngMock.mockResolvedValueOnce({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.6,
+    });
+
+    await expect(
+      searchWeb({
+        providerId: 'searxng',
+        query: 'q',
+        maxResults: 8,
+        baseUrl: 'http://192.168.161.100:6060',
+      }),
+    ).resolves.toEqual({
+      answer: '',
+      sources: [],
+      query: 'q',
+      responseTime: 0.6,
+    });
+    expect(searchWithSearxngMock).toHaveBeenCalledWith({
+      query: 'q',
+      maxResults: 8,
+      baseUrl: 'http://192.168.161.100:6060',
     });
   });
 });
