@@ -13,8 +13,9 @@ import type { StageStore } from '@/lib/api/stage-api';
 import { createStageAPI } from '@/lib/api/stage-api';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useWhiteboardHistoryStore } from '@/lib/store/whiteboard-history';
-import { useMediaGenerationStore, isMediaPlaceholder } from '@/lib/store/media-generation';
+import { useMediaGenerationStore, type MediaTask } from '@/lib/store/media-generation';
 import type { AudioPlayer } from '@/lib/utils/audio-player';
+import type { LegacySpeechAction } from '@/lib/types/action';
 import type {
   Action,
   SpotlightAction,
@@ -35,7 +36,11 @@ import type {
   WidgetAnnotationAction,
   WidgetRevealAction,
 } from '@/lib/types/action';
-import type { CodeLine } from '@openmaic/dsl';
+import type { CodeLine, PPTVideoElement } from '@openmaic/dsl';
+import {
+  resolveVideoMediaForElement,
+  type VideoMediaTaskResolution,
+} from '@/lib/media/media-task-resolution';
 import {
   EFFECT_AUTO_CLEAR_MS,
   MAX_VIDEO_WAIT_MS,
@@ -49,7 +54,9 @@ import {
   wbClearMs,
 } from '@/lib/choreography';
 import katex from 'katex';
+import { safeKatexOptions } from '@openmaic/dsl';
 import { createLogger } from '@/lib/logger';
+import { legacyShapeCompatibilityError } from '@/lib/whiteboard/legacy-shape';
 
 const log = createLogger('ActionEngine');
 
@@ -67,6 +74,48 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const COMMON_LATEX_COMMAND =
+  /\\(?:alpha|beta|cdot|delta|dfrac|frac|gamma|infty|int|lambda|left|lim|mu|neq|omega|pi|pm|prod|rightarrow|right|sigma|sqrt|sum|text|tfrac|theta|times)\b/;
+
+function getDelimitedLatex(content: string): string | null {
+  const trimmed = content.trim();
+
+  if (trimmed.length > 4 && trimmed.startsWith('$$') && trimmed.endsWith('$$')) {
+    return trimmed.slice(2, -2).trim();
+  }
+  if (
+    trimmed.length > 2 &&
+    trimmed.startsWith('$') &&
+    trimmed.endsWith('$') &&
+    !trimmed.startsWith('$$') &&
+    !trimmed.endsWith('$$')
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+
+  return null;
+}
+
+function getLikelyLatexMath(content: string): string | null {
+  const trimmed = content.trim();
+  if (!trimmed || trimmed.startsWith('<')) return null;
+
+  const delimitedLatex = getDelimitedLatex(trimmed);
+  if (delimitedLatex !== null) return delimitedLatex;
+  if (/^[A-Za-z]:\\/.test(trimmed)) return null;
+  if (COMMON_LATEX_COMMAND.test(trimmed) || /[_^]\{/.test(trimmed)) return trimmed;
+
+  const commands = trimmed.match(/\\[A-Za-z]+/g) ?? [];
+  if (commands.length === 0) return null;
+  if (commands.length === 1) {
+    return /\\[A-Za-z]+\s*\{[^{}]*\}/.test(trimmed) ? trimmed : null;
+  }
+  if (!/[=+\-*/^_{}]/.test(trimmed)) return null;
+
+  const commandCharacters = commands.reduce((total, command) => total + command.length, 0);
+  return commandCharacters / trimmed.length >= 0.15 ? trimmed : null;
+}
+
 /** Convert raw code string to CodeLine array with unique IDs */
 function codeToLines(code: string): CodeLine[] {
   return code.split('\n').map((content, i) => ({
@@ -79,6 +128,43 @@ let lineIdCounter = 0;
 /** Generate unique line IDs for newly inserted lines */
 function generateLineIds(count: number): string[] {
   return Array.from({ length: count }, () => `L_${++lineIdCounter}_${Date.now().toString(36)}`);
+}
+
+/** Resolve the video element and its renderer-equivalent media binding for an action. */
+export function resolveActionVideoMedia(
+  stageStore: StageStore,
+  tasks: Readonly<Record<string, MediaTask>>,
+  elementId: string,
+): VideoMediaTaskResolution<MediaTask> | undefined {
+  const { stage, scenes, currentSceneId } = stageStore.getState();
+  const orderedScenes = currentSceneId
+    ? [
+        scenes.find((scene) => scene.id === currentSceneId),
+        ...scenes.filter((scene) => scene.id !== currentSceneId),
+      ]
+    : scenes;
+
+  for (const scene of orderedScenes) {
+    if (!scene || scene.content.type !== 'slide') continue;
+    const element = scene.content.canvas.elements.find(
+      (candidate): candidate is PPTVideoElement =>
+        candidate.id === elementId && candidate.type === 'video',
+    );
+    if (element) return resolveVideoMediaForElement(tasks, element, stage?.id);
+  }
+  return undefined;
+}
+
+/**
+ * Renderer-aligned playability: a task is playable only once its bytes exist
+ * (`done` + objectUrl). A deferred restore is `done` without an objectUrl and
+ * the renderer still treats it as pending (`resolveMediaRef` maps it to
+ * 'pending'), so starting playback in that state would set
+ * playingVideoElementId while no <video> exists — and the later hydration
+ * would not retrigger play, leaving the action stuck until its timeout.
+ */
+function isPlayableVideoTask(task: MediaTask): boolean {
+  return task.status === 'done' && !!task.objectUrl;
 }
 
 // ==================== ActionEngine ====================
@@ -138,6 +224,11 @@ export class ActionEngine {
       if (action.type.startsWith('widget_')) {
         return;
       }
+    }
+
+    if (action.type === 'wb_draw_shape') {
+      const error = legacyShapeCompatibilityError(action);
+      if (error) throw new Error(error);
     }
 
     // Auto-open whiteboard if a draw/clear/delete action is attempted while it's closed
@@ -254,7 +345,9 @@ export class ActionEngine {
 
     return new Promise<void>((resolve) => {
       this.audioPlayer!.onEnded(() => resolve());
-      this.audioPlayer!.play(action.audioId || '', action.audioUrl)
+      // The legacy URL of an unconverted pair rides along as the fallback of
+      // last resort; converted documents carry no audioUrl.
+      this.audioPlayer!.play(action.audioId || '', (action as LegacySpeechAction).audioUrl)
         .then((audioStarted) => {
           if (!audioStarted) resolve();
         })
@@ -269,15 +362,19 @@ export class ActionEngine {
     options: ActionExecutionOptions = {},
   ): Promise<void> {
     if (options.signal?.aborted) return;
-    // Resolve the video element to a generated media reference.
-    // action.elementId is the slide element ID (e.g. video_abc123), but the media
-    // store is keyed by generated media refs, so we need to bridge the two.
-    const placeholderId = this.resolveMediaPlaceholderId(action.elementId);
+    const resolveBinding = () =>
+      resolveActionVideoMedia(
+        this.stageStore,
+        useMediaGenerationStore.getState().tasks,
+        action.elementId,
+      );
+    const binding = resolveBinding();
 
-    if (placeholderId) {
-      const task = useMediaGenerationStore.getState().getTask(placeholderId);
-      if (task && task.status !== 'done') {
-        // Wait for media to be ready (or fail)
+    if (binding?.task) {
+      // Wait while the task is not yet playable: pending/generating, or a
+      // deferred restore that is done but still byte-less.
+      if (!isPlayableVideoTask(binding.task) && binding.task.status !== 'failed') {
+        // Wait for media to be playable (or fail)
         await new Promise<void>((resolve) => {
           let unsubscribe = () => {};
           const finish = () => {
@@ -286,25 +383,25 @@ export class ActionEngine {
             resolve();
           };
           unsubscribe = useMediaGenerationStore.subscribe((state) => {
-            const t = state.tasks[placeholderId];
-            if (!t || t.status === 'done' || t.status === 'failed') {
+            const t = resolveActionVideoMedia(this.stageStore, state.tasks, action.elementId)?.task;
+            if (!t || isPlayableVideoTask(t) || t.status === 'failed') {
               finish();
             }
           });
           options.signal?.addEventListener('abort', finish, { once: true });
           // Check again in case it resolved between getState and subscribe
-          const current = useMediaGenerationStore.getState().tasks[placeholderId];
-          if (!current || current.status === 'done' || current.status === 'failed') {
+          const current = resolveBinding()?.task;
+          if (!current || isPlayableVideoTask(current) || current.status === 'failed') {
             finish();
           }
         });
 
         if (options.signal?.aborted) return;
+      }
 
-        // If failed, skip playback
-        if (useMediaGenerationStore.getState().tasks[placeholderId]?.status === 'failed') {
-          return;
-        }
+      // If failed, skip playback
+      if (resolveBinding()?.task?.status === 'failed') {
+        return;
       }
     }
 
@@ -347,42 +444,6 @@ export class ActionEngine {
     });
   }
 
-  // ==================== Helpers — Media Resolution ====================
-
-  /**
-   * Look up a video/image element's generated media reference in the current stage's scenes.
-   * Returns mediaRef first, then legacy src if it's a media placeholder ID.
-   */
-  private resolveMediaPlaceholderId(elementId: string): string | null {
-    const { scenes, currentSceneId } = this.stageStore.getState();
-
-    // Search current scene first for efficiency, then remaining scenes
-    const orderedScenes = currentSceneId
-      ? [
-          scenes.find((s) => s.id === currentSceneId),
-          ...scenes.filter((s) => s.id !== currentSceneId),
-        ]
-      : scenes;
-
-    for (const scene of orderedScenes) {
-      if (!scene || scene.type !== 'slide') continue;
-      const elements = (
-        scene.content as {
-          canvas?: { elements?: Array<{ id: string; src?: string; mediaRef?: string }> };
-        }
-      )?.canvas?.elements;
-      if (!Array.isArray(elements)) continue;
-      const el = elements.find((e: { id: string }) => e.id === elementId);
-      if (el && typeof el.mediaRef === 'string') {
-        return el.mediaRef;
-      }
-      if (el && typeof el.src === 'string' && isMediaPlaceholder(el.src)) {
-        return el.src;
-      }
-    }
-    return null;
-  }
-
   // ==================== Synchronous — Whiteboard ====================
 
   /** Auto-open the whiteboard if it's not already open */
@@ -405,12 +466,25 @@ export class ActionEngine {
     action: WbDrawTextAction,
     options: ActionExecutionOptions = {},
   ): Promise<void> {
+    let htmlContent = action.content ?? '';
+    if (!htmlContent) return; // nothing to draw
+
+    const latex = getLikelyLatexMath(htmlContent);
+    if (latex !== null) {
+      return this.executeWbDrawLatex(
+        {
+          ...action,
+          type: 'wb_draw_latex',
+          latex,
+        },
+        options,
+      );
+    }
+
     const wb = this.stageAPI.whiteboard.get();
     if (!wb.success || !wb.data) return;
 
     const fontSize = action.fontSize ?? 18;
-    let htmlContent = action.content ?? '';
-    if (!htmlContent) return; // nothing to draw
     if (!htmlContent.startsWith('<')) {
       htmlContent = `<p style="font-size: ${fontSize}px;">${htmlContent}</p>`;
     }
@@ -450,7 +524,7 @@ export class ActionEngine {
         id: action.elementId || '',
         type: 'shape',
         viewBox: [1000, 1000] as [number, number],
-        path: SHAPE_PATHS[action.shape] ?? SHAPE_PATHS.rectangle,
+        path: SHAPE_PATHS[action.shape],
         left: action.x,
         top: action.y,
         width: action.width,
@@ -504,11 +578,14 @@ export class ActionEngine {
     if (!wb.success || !wb.data) return;
 
     try {
-      const html = katex.renderToString(action.latex, {
-        throwOnError: false,
-        displayMode: true,
-        output: 'html',
-      });
+      const html = katex.renderToString(
+        action.latex,
+        safeKatexOptions({
+          throwOnError: false,
+          displayMode: true,
+          output: 'html',
+        }),
+      );
 
       this.stageAPI.whiteboard.addElement(
         {
@@ -719,9 +796,9 @@ export class ActionEngine {
       case 'replace_lines': {
         if (!action.lineIds?.length) return;
         const replaceIds = action.lineIds;
-        const firstIdx = lines.findIndex((l) => l.id === replaceIds[0]);
-        if (firstIdx === -1) return;
         const deleteSet = new Set(replaceIds);
+        const firstIdx = lines.findIndex((l) => deleteSet.has(l.id));
+        if (firstIdx === -1) return;
         lines = lines.filter((l) => !deleteSet.has(l.id));
         const newLines = newContentLines.map((content, i) => ({
           id: i < replaceIds.length ? replaceIds[i] : newLineIds[i],

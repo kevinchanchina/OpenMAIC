@@ -33,7 +33,17 @@ const { fakeStore, dbMock, prepareMock } = vi.hoisted(() => {
       }),
     },
     stageOutlines: { delete: vi.fn().mockResolvedValue(undefined) },
+    stageFolders: { delete: vi.fn().mockResolvedValue(undefined) },
     playbackState: { delete: vi.fn().mockResolvedValue(undefined) },
+    mediaFiles: {
+      where: () => ({ equals: () => ({ toArray: vi.fn().mockResolvedValue([]) }) }),
+      bulkDelete: vi.fn().mockResolvedValue(undefined),
+    },
+    audioFiles: {
+      where: () => ({ equals: () => ({ toArray: vi.fn().mockResolvedValue([]) }) }),
+      bulkGet: vi.fn().mockResolvedValue([]),
+      bulkDelete: vi.fn().mockResolvedValue(undefined),
+    },
     generatedAgents: {
       where: () => ({
         equals: () => ({ delete: vi.fn().mockResolvedValue(0) }),
@@ -74,7 +84,10 @@ vi.mock('@/lib/utils/chat-storage-lock', () => ({
     async (fn: (release: (value: unknown) => void) => Promise<unknown>) => fn(() => undefined),
   ),
 }));
-vi.mock('@/lib/utils/database', () => ({ db: dbMock }));
+vi.mock('@/lib/device-storage/database', () => ({ db: dbMock }));
+vi.mock('@/lib/media/asset-pool', () => ({
+  removeAsset: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock('@/lib/playback/cursor', () => ({ clearCursor: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('@/lib/quiz/persistence', () => ({ clearAllForScene: vi.fn() }));
 vi.mock('@/lib/runtime/store', () => ({

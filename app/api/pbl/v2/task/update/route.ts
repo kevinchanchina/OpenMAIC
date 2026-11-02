@@ -17,8 +17,6 @@
  * No LLM involvement. Stateless.
  */
 
-export const maxDuration = 60;
-
 import type { NextRequest } from 'next/server';
 
 import { apiError, apiSuccess } from '@/lib/server/api-response';
@@ -30,9 +28,9 @@ import {
   advanceMicrotask,
   completeRoleplayAct,
   appendTaskDividerMessage,
-} from '@/lib/pbl/v2/operations/progress';
+} from '@/lib/pbl/v2/operations/kernel/progress';
 import type { PBLProjectV2 } from '@/lib/pbl/v2/types';
-import { currentPendingTaskCompletion } from '@/lib/pbl/v2/operations/task-completion';
+import { currentPendingTaskCompletion } from '@/lib/pbl/v2/operations/kernel/task-completion';
 
 interface UpdateRequest {
   project: PBLProjectV2;

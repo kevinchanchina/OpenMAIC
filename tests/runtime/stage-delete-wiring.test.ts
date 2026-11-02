@@ -9,7 +9,22 @@ const { deleteDocument, clearCurrentScene, clearAllForScene } = vi.hoisted(() =>
 vi.mock('@/lib/document-store', () => ({
   clearCurrentScene,
   mutateDocument: vi.fn(async (_stageId, work) =>
-    work({ scenes: [{ id: 'new-scene' }] }, { deleteDocument }),
+    work(
+      {
+        stage: { id: 'stage-7', name: 'Stage', createdAt: 1, updatedAt: 1 },
+        scenes: [
+          {
+            id: 'new-scene',
+            stageId: 'stage-7',
+            type: 'text',
+            title: 'Scene',
+            order: 1,
+            content: { type: 'text', markdown: '' },
+          },
+        ],
+      },
+      { deleteDocument },
+    ),
   ),
   getDocumentStore: vi.fn(() => ({
     loadDocument: vi.fn().mockResolvedValue({ scenes: [{ id: 'new-scene' }] }),
@@ -18,35 +33,28 @@ vi.mock('@/lib/document-store', () => ({
 }));
 
 // The live classroom-deletion flow (app/page.tsx) goes through
-// `deleteStageData` in stage-storage. Mock its module dependencies (the
-// established pattern for database-touching code — no Dexie-in-node harness)
-// and run the REAL function to prove it cascades into the runtime layer.
+// `deleteStageData` in stage-storage. Mock its module dependencies and run the
+// REAL function to prove it cascades into the runtime layer.
 vi.mock('@/lib/runtime/store', () => ({
   beginStageRuntimeDeletionSafely: vi.fn(() => ({
     completion: Promise.resolve(),
     settlement: Promise.resolve(),
   })),
 }));
-vi.mock('@/lib/utils/database', () => ({
+vi.mock('@/lib/device-storage/database', () => ({
   db: {
-    transaction: vi.fn(async (_mode, _tables, work) => work()),
-    stages: { delete: vi.fn().mockResolvedValue(undefined) },
-    stageOutlines: { delete: vi.fn().mockResolvedValue(undefined) },
-    playbackState: { delete: vi.fn().mockResolvedValue(undefined) },
-    scenes: {
-      where: () => ({
-        equals: () => ({
-          toArray: vi.fn().mockResolvedValue([{ id: 'scene-1' }]),
-          delete: vi.fn().mockResolvedValue(1),
-        }),
-      }),
+    mediaFiles: {
+      where: () => ({ equals: () => ({ toArray: vi.fn().mockResolvedValue([]) }) }),
+      bulkDelete: vi.fn().mockResolvedValue(undefined),
     },
   },
+}));
+vi.mock('@/lib/media/asset-pool', () => ({
+  removeAsset: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('@/lib/utils/chat-storage', () => ({
   saveChatSessions: vi.fn(),
   loadChatSessions: vi.fn(),
-  deleteChatSessions: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('@/lib/quiz/persistence', () => ({
   clearAllForScene,
@@ -68,7 +76,6 @@ describe('deleteStageData runtime cascade', () => {
     expect(vi.mocked(withRuntimeStorageExclusiveLockUntilSettled)).toHaveBeenCalledOnce();
     expect(deleteDocument).toHaveBeenCalledExactlyOnceWith('stage-7');
     expect(clearCurrentScene).toHaveBeenCalledExactlyOnceWith('stage-7');
-    expect(clearAllForScene).toHaveBeenCalledWith('scene-1');
-    expect(clearAllForScene).toHaveBeenCalledWith('new-scene');
+    expect(clearAllForScene).toHaveBeenCalledExactlyOnceWith('new-scene');
   });
 });

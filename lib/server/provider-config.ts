@@ -1,3 +1,14 @@
+import { presetIdFor } from '@/lib/config/preset-ids';
+import { WEB_SEARCH_PROVIDERS } from '@/lib/web-search/constants';
+import {
+  assertDeploymentModelAuthorized,
+  selectsUpstreamModel,
+  deploymentAuthorizedModels,
+  deploymentDefaultModel,
+  ModelAuthorizationError,
+} from '@/lib/server/model-config/model-authorization';
+import { deploymentConfig } from '@/lib/server/model-config/runtime';
+import type { SlotCapability } from '@/lib/config/model-slots';
 /**
  * Server-side Provider Configuration
  *
@@ -9,6 +20,12 @@ import fs from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
 import { createLogger } from '@/lib/logger';
+import {
+  DEFAULT_QWEN_TTS_VOICE_CLONE_MODEL,
+  isQwenCatalogVoice,
+  isQwenVoiceCloneModel,
+  TTS_PROVIDERS,
+} from '@/lib/audio/constants';
 
 const log = createLogger('ServerProviderConfig');
 
@@ -16,7 +33,7 @@ const log = createLogger('ServerProviderConfig');
 // Types
 // ---------------------------------------------------------------------------
 
-interface ServerProviderEntry {
+export interface ServerProviderEntry {
   apiKey: string;
   baseUrl?: string;
   models?: string[];
@@ -28,12 +45,12 @@ interface ServerProviderEntry {
   /**
    * Admin/operator force-off switch. `false` disables the provider for ALL
    * clients regardless of the user's per-provider toggle (server precedence).
-   * Currently honored for TTS only (#665).
+   * Honored for the capability sections in {@link DISABLE_ENV_MAPS} (#665).
    */
   enabled?: boolean;
 }
 
-interface ServerConfig {
+export interface ServerConfig {
   providers: Record<string, ServerProviderEntry>;
   tts: Record<string, ServerProviderEntry>;
   asr: Record<string, ServerProviderEntry>;
@@ -41,17 +58,23 @@ interface ServerConfig {
   image: Record<string, ServerProviderEntry>;
   video: Record<string, ServerProviderEntry>;
   webSearch: Record<string, ServerProviderEntry>;
-  /** TTS provider IDs the operator force-disabled (server precedence). */
-  ttsDisabled: Set<string>;
+  /** Provider IDs the operator force-disabled per capability section (server precedence). */
+  disabled: Record<CapabilitySection, Set<string>>;
 }
 
 // ---------------------------------------------------------------------------
 // Env-var prefix mappings
 // ---------------------------------------------------------------------------
 
-const LLM_ENV_MAP: Record<string, string> = {
+/**
+ * Env-var prefix → LLM provider-id mapping (e.g. `DEEPSEEK_API_KEY` configures
+ * the `deepseek` provider). Exported for boot-time config validation, which
+ * checks `<PREFIX>_MODELS` pins against the provider's key env.
+ */
+export const LLM_ENV_MAP: Record<string, string> = {
   OPENAI: 'openai',
   AZURE_OPENAI: 'azure',
+  ATLASCLOUD: 'atlascloud',
   ANTHROPIC: 'anthropic',
   GOOGLE: 'google',
   DEEPSEEK: 'deepseek',
@@ -67,8 +90,10 @@ const LLM_ENV_MAP: Record<string, string> = {
   TENCENT_HUNYUAN: 'tencent-hunyuan',
   XIAOMI: 'xiaomi',
   MIMO: 'xiaomi',
+  TOKENDANCE: 'tokendance',
   OLLAMA: 'ollama',
   LEMONADE: 'lemonade',
+  BEDROCK: 'bedrock',
 };
 
 const TTS_ENV_MAP: Record<string, string> = {
@@ -80,23 +105,15 @@ const TTS_ENV_MAP: Record<string, string> = {
   TTS_DOUBAO: 'doubao-tts',
   TTS_ELEVENLABS: 'elevenlabs-tts',
   TTS_MINIMAX: 'minimax-tts',
+  TTS_GOOGLE: 'google-tts',
   TTS_LEMONADE: 'lemonade-tts',
-};
-
-/**
- * Env prefixes for the TTS force-disable switch (`TTS_<PREFIX>_ENABLED=false`).
- * Superset of TTS_ENV_MAP: browser-native has no credential env (it is
- * client-only) but operators may still want to force it off fleet-wide (#665).
- */
-const TTS_DISABLE_ENV_MAP: Record<string, string> = {
-  ...TTS_ENV_MAP,
-  TTS_BROWSER_NATIVE: 'browser-native-tts',
 };
 
 const ASR_ENV_MAP: Record<string, string> = {
   ASR_OPENAI: 'openai-whisper',
   ASR_QWEN: 'qwen-asr',
   ASR_AZURE: 'azure-asr',
+  ASR_FUNASR: 'funasr-asr',
   ASR_LEMONADE: 'lemonade-asr',
 };
 
@@ -113,26 +130,84 @@ const IMAGE_ENV_MAP: Record<string, string> = {
   IMAGE_NANO_BANANA: 'nano-banana',
   IMAGE_MINIMAX: 'minimax-image',
   IMAGE_GROK: 'grok-image',
+  IMAGE_GLM: 'glm-image',
   IMAGE_LEMONADE: 'lemonade',
+  IMAGE_OPENROUTER: 'openrouter-image',
 };
 
 const VIDEO_ENV_MAP: Record<string, string> = {
   VIDEO_SEEDANCE: 'seedance',
   VIDEO_KLING: 'kling',
-  VIDEO_VEO: 'veo',
-  VIDEO_SORA: 'sora',
   VIDEO_MINIMAX: 'minimax-video',
   VIDEO_GROK: 'grok-video',
   VIDEO_HAPPYHORSE: 'happyhorse',
+  VIDEO_OPENROUTER: 'openrouter-video',
 };
 
 const WEB_SEARCH_ENV_MAP: Record<string, string> = {
   TAVILY: 'tavily',
+  EXA: 'exa',
+  FIRECRAWL: 'firecrawl',
   BOCHA: 'bocha',
   BRAVE: 'brave',
   BAIDU: 'baidu',
+  // WEB_SEARCH_ prefix avoids colliding with ANTHROPIC_* LLM provider vars.
+  WEB_SEARCH_CLAUDE: 'claude',
   WEB_SEARCH_MINIMAX: 'minimax',
+  // Dedicated prefix avoids colliding with the Doubao LLM provider vars.
+  WEB_SEARCH_DOUBAO: 'doubao',
   SEARXNG: 'searxng',
+};
+
+// ---------------------------------------------------------------------------
+// Force-disable maps
+// ---------------------------------------------------------------------------
+
+/**
+ * Capability sections that support the operator force-off switch
+ * (`<CAP>_<PREFIX>_ENABLED=false`). LLM and PDF are intentionally not included:
+ * their enablement stays purely credential-driven.
+ */
+type CapabilitySection = 'tts' | 'asr' | 'image' | 'video' | 'webSearch';
+
+/**
+ * Env prefixes for each capability's force-disable switch
+ * (`<CAP>_<PREFIX>_ENABLED=false`). Built from the existing per-section env
+ * maps plus the client-only keyless providers that have no credential env
+ * (browser-native, ComfyUI) — operators may still want to force those off
+ * fleet-wide (#665). The `_ENABLED` vars can only disable; they never
+ * force-enable a provider that has no credentials configured.
+ */
+const DISABLE_ENV_MAPS: Record<CapabilitySection, Record<string, string>> = {
+  tts: {
+    ...TTS_ENV_MAP,
+    TTS_BROWSER_NATIVE: 'browser-native-tts',
+  },
+  asr: {
+    ...ASR_ENV_MAP,
+    ASR_BROWSER_NATIVE: 'browser-native',
+  },
+  image: {
+    ...IMAGE_ENV_MAP,
+    // comfyui-image lives in the client-side catalog only (no credential env),
+    // but operators may still want to force it off fleet-wide.
+    IMAGE_COMFYUI: 'comfyui-image',
+  },
+  video: { ...VIDEO_ENV_MAP },
+  webSearch: {
+    ...WEB_SEARCH_ENV_MAP,
+    WEB_SEARCH_KIMI: 'kimi',
+    WEB_SEARCH_DEEPSEEK: 'deepseek',
+  },
+};
+
+/** YAML section key per capability (web-search is hyphenated in YAML). */
+const YAML_SECTION_KEY: Record<CapabilitySection, keyof YamlData> = {
+  tts: 'tts',
+  asr: 'asr',
+  image: 'image',
+  video: 'video',
+  webSearch: 'web-search',
 };
 
 // ---------------------------------------------------------------------------
@@ -167,6 +242,18 @@ function loadYamlFile(filename: string): YamlData {
 // Env-var helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Normalize a configured model list the same way the env-var path does:
+ * trim whitespace and drop empty entries. The YAML path stores model arrays
+ * verbatim, so without this a garbage `models: [""]` would surface as a
+ * truthy pin (its first entry, an empty string). Returns undefined when
+ * nothing survives normalization ("no models configured").
+ */
+function normalizeModelList(models: string[] | undefined): string[] | undefined {
+  const parsed = models?.map((model) => model.trim()).filter(Boolean);
+  return parsed && parsed.length > 0 ? parsed : undefined;
+}
+
 function loadEnvSection(
   envMap: Record<string, string>,
   yamlSection: Record<string, Partial<ServerProviderEntry>> | undefined,
@@ -195,7 +282,7 @@ function loadEnvSection(
         result[id] = {
           apiKey: entry.apiKey || '',
           baseUrl: entry.baseUrl,
-          models: entry.models,
+          models: normalizeModelList(entry.models),
           proxy: entry.proxy,
         };
       }
@@ -245,27 +332,36 @@ function parseBooleanEnv(raw: string): boolean {
 }
 
 /**
- * Collect TTS provider IDs the operator force-disabled, from YAML
- * (`tts.<id>.enabled: false`) and env (`TTS_<PREFIX>_ENABLED=false`). An
- * explicit env `true` overrides a YAML disable (env precedence, matching the
- * rest of this module).
+ * Collect provider IDs the operator force-disabled per capability section, from
+ * YAML (`<section>.<id>.enabled: false`) and env (`<CAP>_<PREFIX>_ENABLED`).
+ * An explicit env `true` overrides a YAML disable (env precedence, matching the
+ * rest of this module). Unset / empty values are "no opinion" — they never
+ * silently override an explicit YAML disable. The `_ENABLED` vars can only
+ * disable; they never create or force-enable a provider entry.
  */
-function collectDisabledTTS(
-  yamlTts: Record<string, Partial<ServerProviderEntry>> | undefined,
-): Set<string> {
-  const disabled = new Set<string>();
-  if (yamlTts) {
-    for (const [id, entry] of Object.entries(yamlTts)) {
-      if (entry?.enabled === false) disabled.add(id);
+function collectDisabledProviders(yamlData: YamlData): Record<CapabilitySection, Set<string>> {
+  const disabled: Record<CapabilitySection, Set<string>> = {
+    tts: new Set<string>(),
+    asr: new Set<string>(),
+    image: new Set<string>(),
+    video: new Set<string>(),
+    webSearch: new Set<string>(),
+  };
+  for (const section of Object.keys(DISABLE_ENV_MAPS) as CapabilitySection[]) {
+    const yamlSection = yamlData[YAML_SECTION_KEY[section]];
+    if (yamlSection) {
+      for (const [id, entry] of Object.entries(yamlSection)) {
+        if (entry?.enabled === false) disabled[section].add(id);
+      }
     }
-  }
-  for (const [prefix, providerId] of Object.entries(TTS_DISABLE_ENV_MAP)) {
-    const raw = process.env[`${prefix}_ENABLED`];
-    // Treat unset / empty (e.g. a blank CI-templated value) as "no opinion" so
-    // it never silently overrides an explicit YAML disable.
-    if (raw === undefined || raw.trim() === '') continue;
-    if (parseBooleanEnv(raw)) disabled.delete(providerId);
-    else disabled.add(providerId);
+    for (const [prefix, providerId] of Object.entries(DISABLE_ENV_MAPS[section])) {
+      const raw = process.env[`${prefix}_ENABLED`];
+      // Treat unset / empty (e.g. a blank CI-templated value) as "no opinion" so
+      // it never silently overrides an explicit YAML disable.
+      if (raw === undefined || raw.trim() === '') continue;
+      if (parseBooleanEnv(raw)) disabled[section].delete(providerId);
+      else disabled[section].add(providerId);
+    }
   }
   return disabled;
 }
@@ -277,6 +373,7 @@ function collectDisabledTTS(
 const DEFAULT_FILENAME = 'server-providers.yml';
 const OPENAI_IMAGE_PROVIDER_ID = 'openai-image';
 const ALIDOCMIND_PROVIDER_ID = 'alidocmind';
+const BEDROCK_PROVIDER_ID = 'bedrock';
 
 /** Cache keyed by YAML filename (empty string = default file). */
 const _configs: Map<string, ServerConfig> = new Map();
@@ -339,6 +436,24 @@ export function resolveManagedAliDocMindCredentials():
   return undefined;
 }
 
+/** Provider-neutral extraction input populated from server-managed media credentials. */
+export function resolveServerMediaExtractorConfig(): {
+  providerId: string;
+  accessKeyId?: string;
+  accessKeySecret?: string;
+  baseUrl?: string;
+  allowEnvFallback: boolean;
+} {
+  const credentials = resolveManagedAliDocMindCredentials();
+  return {
+    providerId: '',
+    accessKeyId: credentials?.accessKeyId,
+    accessKeySecret: credentials?.accessKeySecret,
+    baseUrl: credentials?.baseUrl,
+    allowEnvFallback: true,
+  };
+}
+
 function applyOpenAIImageFallback(
   imageConfig: Record<string, ServerProviderEntry>,
   yamlImageSection: Record<string, Partial<ServerProviderEntry>> | undefined,
@@ -353,10 +468,56 @@ function applyOpenAIImageFallback(
     apiKey,
     baseUrl:
       yamlOpenAIImage?.baseUrl || process.env.IMAGE_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
-    models: yamlOpenAIImage?.models,
+    models:
+      splitModels(process.env.IMAGE_OPENAI_MODELS) ?? normalizeModelList(yamlOpenAIImage?.models),
     proxy: yamlOpenAIImage?.proxy,
   };
   return imageConfig;
+}
+
+function splitModels(models: string | undefined): string[] | undefined {
+  const parsed = models
+    ?.split(',')
+    .map((model) => model.trim())
+    .filter(Boolean);
+  return parsed && parsed.length > 0 ? parsed : undefined;
+}
+
+function applyBedrockProviderConfig(
+  providers: Record<string, ServerProviderEntry>,
+  yamlProviders: Record<string, Partial<ServerProviderEntry>> | undefined,
+): Record<string, ServerProviderEntry> {
+  const yamlBedrock = yamlProviders?.[BEDROCK_PROVIDER_ID];
+  const envApiKey = process.env.BEDROCK_API_KEY || undefined;
+  const envBaseUrl = process.env.BEDROCK_BASE_URL || undefined;
+  const envRegion = process.env.BEDROCK_REGION?.trim() || undefined;
+  const envModels = splitModels(process.env.BEDROCK_MODELS);
+  const hasExplicitBedrockEnv =
+    !!envRegion ||
+    !!envModels ||
+    !!envApiKey ||
+    !!envBaseUrl ||
+    !!process.env.AWS_BEARER_TOKEN_BEDROCK;
+  const hasYamlBedrock = Object.prototype.hasOwnProperty.call(
+    yamlProviders ?? {},
+    BEDROCK_PROVIDER_ID,
+  );
+
+  if (!providers[BEDROCK_PROVIDER_ID] && !hasExplicitBedrockEnv && !hasYamlBedrock) {
+    return providers;
+  }
+
+  providers[BEDROCK_PROVIDER_ID] = {
+    apiKey: envApiKey || yamlBedrock?.apiKey || providers[BEDROCK_PROVIDER_ID]?.apiKey || '',
+    baseUrl: envBaseUrl || yamlBedrock?.baseUrl || providers[BEDROCK_PROVIDER_ID]?.baseUrl,
+    models:
+      envModels ||
+      normalizeModelList(yamlBedrock?.models) ||
+      providers[BEDROCK_PROVIDER_ID]?.models,
+    proxy: yamlBedrock?.proxy || providers[BEDROCK_PROVIDER_ID]?.proxy,
+  };
+
+  return providers;
 }
 
 function buildConfig(yamlData: YamlData): ServerConfig {
@@ -366,16 +527,44 @@ function buildConfig(yamlData: YamlData): ServerConfig {
     }),
     yamlData.image,
   );
+  const providers = applyBedrockProviderConfig(
+    loadEnvSection(LLM_ENV_MAP, yamlData.providers, {
+      keylessProviders: new Set(['ollama', 'lemonade', BEDROCK_PROVIDER_ID]),
+    }),
+    yamlData.providers,
+  );
+
+  const webSearch = loadEnvSection(WEB_SEARCH_ENV_MAP, yamlData['web-search'], {
+    keylessProviders: new Set(['brave', 'searxng']),
+  });
+  for (const provider of Object.values(WEB_SEARCH_PROVIDERS)) {
+    if (!provider.sharedChatProviderId) continue;
+    const explicit = yamlData['web-search']?.[provider.id];
+    const optIn = provider.enableEnvVar && process.env[provider.enableEnvVar];
+    if (!explicit && !(optIn?.trim() && parseBooleanEnv(optIn))) continue;
+    const shared = providers[provider.sharedChatProviderId];
+    const configured = webSearch[provider.id];
+    const apiKey = configured?.apiKey || shared?.apiKey;
+    // Append shared accounts after existing search providers, including when
+    // their explicit YAML entry was loaded earlier, preserving default order.
+    delete webSearch[provider.id];
+    if (!apiKey) continue;
+    webSearch[provider.id] = {
+      apiKey,
+      baseUrl: configured?.baseUrl ?? explicit?.baseUrl ?? shared?.baseUrl,
+      proxy: configured?.proxy ?? explicit?.proxy ?? shared?.proxy,
+      // Search has no model selector; chat pins must stay on the chat account.
+      models: undefined,
+    };
+  }
 
   return {
-    providers: loadEnvSection(LLM_ENV_MAP, yamlData.providers, {
-      keylessProviders: new Set(['ollama', 'lemonade']),
-    }),
+    providers,
     tts: loadEnvSection(TTS_ENV_MAP, yamlData.tts, {
       keylessProviders: new Set(['voxcpm-tts', 'lemonade-tts']),
     }),
     asr: loadEnvSection(ASR_ENV_MAP, yamlData.asr, {
-      keylessProviders: new Set(['lemonade-asr']),
+      keylessProviders: new Set(['funasr-asr', 'lemonade-asr']),
     }),
     pdf: applyAliDocMindFallback(
       loadEnvSection(PDF_ENV_MAP, yamlData.pdf, {
@@ -386,10 +575,8 @@ function buildConfig(yamlData: YamlData): ServerConfig {
     ),
     image,
     video: loadEnvSection(VIDEO_ENV_MAP, yamlData.video),
-    webSearch: loadEnvSection(WEB_SEARCH_ENV_MAP, yamlData['web-search'], {
-      keylessProviders: new Set(['brave', 'searxng']),
-    }),
-    ttsDisabled: collectDisabledTTS(yamlData.tts),
+    webSearch,
+    disabled: collectDisabledProviders(yamlData),
   };
 }
 
@@ -416,7 +603,13 @@ function getConfig(): ServerConfig {
 
   const yamlData = loadYamlFile(DEFAULT_FILENAME);
   const config = buildConfig(yamlData);
-  logConfig(config, DEFAULT_FILENAME);
+  // Environment variables are always read; the file only when it has content.
+  logConfig(
+    config,
+    Object.keys(yamlData).length > 0
+      ? `${DEFAULT_FILENAME} and environment variables`
+      : 'environment variables',
+  );
   _configs.set('', config);
   return config;
 }
@@ -433,11 +626,43 @@ function getConfig(): ServerConfig {
 // server config (the bug class #533 patched route-by-route).
 // ---------------------------------------------------------------------------
 
-type ProviderSection = Exclude<keyof ServerConfig, 'ttsDisabled'>;
+type ProviderSection = 'providers' | 'tts' | 'asr' | 'pdf' | 'image' | 'video' | 'webSearch';
+
+/**
+ * The operator's entry for a provider, or undefined. Provider ids come from
+ * requests, so only the section's own keys count: an id such as `constructor`
+ * or `__proto__` must not resolve to an inherited object property.
+ */
+function serverEntry(
+  section: ProviderSection,
+  providerId: string,
+): ServerProviderEntry | undefined {
+  const entries = getConfig()[section];
+  return Object.hasOwn(entries, providerId) ? entries[providerId] : undefined;
+}
 
 /** Whether the operator configured this provider in the given section. */
 export function isServerConfiguredProvider(section: ProviderSection, providerId: string): boolean {
-  return !!getConfig()[section][providerId];
+  return serverEntry(section, providerId) !== undefined;
+}
+
+/** Whether the operator force-disabled this provider in the given capability section (server precedence). */
+export function isServerProviderDisabled(section: CapabilitySection, providerId: string): boolean {
+  return getConfig().disabled[section].has(providerId);
+}
+
+/**
+ * Enabled-provider resolver: the provider IDs of a capability listing that
+ * this deployment actually serves — present in the listing and not
+ * force-disabled (`{ disabled: true }`, #665). The provider-config API
+ * deliberately includes force-disabled providers so admin surfaces can show
+ * them; every capability consumer (agent tool selectors and gates, server
+ * default resolution) must resolve enabledness through this — disable wins.
+ */
+export function enabledProviderIds<T extends { disabled?: boolean }>(
+  listing: Record<string, T>,
+): string[] {
+  return Object.keys(listing).filter((id) => !listing[id]?.disabled);
 }
 
 function resolveSectionApiKey(
@@ -445,7 +670,7 @@ function resolveSectionApiKey(
   providerId: string,
   clientKey?: string,
 ): string {
-  const entry = getConfig()[section][providerId];
+  const entry = serverEntry(section, providerId);
   if (entry) return entry.apiKey || ''; // managed: server key is authoritative
   return clientKey || ''; // unmanaged: client-supplied key only
 }
@@ -455,7 +680,7 @@ function resolveSectionBaseUrl(
   providerId: string,
   clientBaseUrl?: string,
 ): string | undefined {
-  const entry = getConfig()[section][providerId];
+  const entry = serverEntry(section, providerId);
   if (entry) return entry.baseUrl; // managed: server base URL is authoritative
   return clientBaseUrl; // unmanaged: client-supplied base URL only
 }
@@ -463,6 +688,15 @@ function resolveSectionBaseUrl(
 // ---------------------------------------------------------------------------
 // Public API — LLM
 // ---------------------------------------------------------------------------
+
+/**
+ * The resolved server provider configuration (YAML plus environment, with the
+ * operator's force-off switches), for translating it into the model
+ * configuration of RFC #1701. Read-only: callers must not mutate it.
+ */
+export function getServerProviderConfig(): Readonly<ServerConfig> {
+  return getConfig();
+}
 
 /**
  * Returns server-configured LLM providers. Exposes only the allowed model list
@@ -491,7 +725,7 @@ export function resolveBaseUrl(providerId: string, clientBaseUrl?: string): stri
 
 /** Resolve proxy URL for a provider (server config only) */
 export function resolveProxy(providerId: string): string | undefined {
-  return getConfig().providers[providerId]?.proxy;
+  return serverEntry('providers', providerId)?.proxy;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,8 +742,19 @@ export function getServerTTSProviders(): Record<string, { disabled?: boolean }> 
   const cfg = getConfig();
   const result: Record<string, { disabled?: boolean }> = {};
   for (const id of Object.keys(cfg.tts)) result[id] = {};
-  for (const id of cfg.ttsDisabled) result[id] = { disabled: true };
+  for (const id of cfg.disabled.tts) result[id] = { disabled: true };
   return result;
+}
+
+/**
+ * TTS providers this deployment actually serves: present in server config and
+ * not force-disabled. Browser-native voices are excluded (no static voice list
+ * and no server-side synthesis without a configured backend).
+ */
+export function enabledServerTTSProviderIds(): string[] {
+  return Object.entries(getServerTTSProviders())
+    .filter(([id, info]) => id !== 'browser-native-tts' && !info.disabled)
+    .map(([id]) => id);
 }
 
 export function resolveTTSApiKey(providerId: string, clientKey?: string): string {
@@ -518,22 +763,99 @@ export function resolveTTSApiKey(providerId: string, clientKey?: string): string
 
 /** Whether the operator force-disabled this TTS provider (server precedence, #665). */
 export function isServerTTSProviderDisabled(providerId: string): boolean {
-  return getConfig().ttsDisabled.has(providerId);
+  return isServerProviderDisabled('tts', providerId);
 }
 
 export function resolveTTSBaseUrl(providerId: string, clientBaseUrl?: string): string | undefined {
-  return resolveSectionBaseUrl('tts', providerId, clientBaseUrl);
+  return (
+    resolveSectionBaseUrl('tts', providerId, clientBaseUrl) ||
+    TTS_PROVIDERS[providerId as keyof typeof TTS_PROVIDERS]?.defaultBaseUrl
+  );
+}
+
+/** Resolve the server-only Qwen VC model override without exposing env values to clients. */
+export function resolveQwenVoiceCloneModel(): string {
+  return process.env.TTS_QWEN_VOICE_CLONE_MODEL?.trim() || DEFAULT_QWEN_TTS_VOICE_CLONE_MODEL;
+}
+
+export class TTSModelNotAllowedError extends Error {
+  readonly code = 'INVALID_REQUEST';
+  readonly httpStatus = 400;
+
+  constructor(providerId: string, modelId: string) {
+    super(`Model "${modelId}" is not allowed for provider "${providerId}"`);
+    this.name = 'TTSModelNotAllowedError';
+  }
 }
 
 /**
- * Resolve the TTS model. A managed provider may pin its model server-side
- * (`${PREFIX}_MODELS`, first entry) — authoritative like its key/baseUrl, since
- * the managed-provider UI does not expose a model field. Otherwise the client
- * model wins.
+ * The TTS model of a configured slot: its own model, with only the voice
+ * compatibility rules of `resolveTTSModel` applied (a cloned voice speaks
+ * through the clone model, a catalog voice never does). Legacy server pins do
+ * not apply.
  */
-export function resolveTTSModel(providerId: string, clientModel?: string): string | undefined {
-  const entry = getConfig().tts[providerId];
-  if (entry?.models && entry.models.length > 0) return entry.models[0];
+export function slotTTSModel(
+  providerId: string,
+  modelId: string | undefined,
+  voiceId?: string,
+  configuredVoices?: readonly { id: string }[],
+): string | undefined {
+  return ttsModelFor(providerId, [], modelId, voiceId, configuredVoices);
+}
+
+/** Resolve a TTS model authorized by the deployment, or the BYOK client's choice. */
+export function resolveTTSModel(
+  providerId: string,
+  clientModel?: string,
+  voiceId?: string,
+  configuredVoices?: readonly { id: string }[],
+): string | undefined {
+  const requested = resolveManagedMediaModel('tts', providerId, clientModel);
+  const model = ttsModelFor(providerId, [], requested, voiceId, configuredVoices);
+  // Voice compatibility may change the wire model; it still needs authorization.
+  return resolveManagedMediaModel('tts', providerId, model);
+}
+
+function ttsModelFor(
+  providerId: string,
+  pinnedModels: string[],
+  clientModel?: string,
+  voiceId?: string,
+  configuredVoices?: readonly { id: string }[],
+): string | undefined {
+  if (providerId === 'qwen-tts') {
+    const vcModel = resolveQwenVoiceCloneModel();
+    const requestedIsVCSentinel = !!clientModel && isQwenVoiceCloneModel(clientModel, vcModel);
+    const normalizedClientModel = requestedIsVCSentinel ? vcModel : clientModel;
+    const allowedModels = new Set([...pinnedModels, vcModel]);
+
+    if (
+      pinnedModels.length > 0 &&
+      normalizedClientModel &&
+      !allowedModels.has(normalizedClientModel)
+    ) {
+      throw new TTSModelNotAllowedError(providerId, normalizedClientModel);
+    }
+
+    if (voiceId) {
+      if (!isQwenCatalogVoice(voiceId, configuredVoices)) return vcModel;
+      const pinnedCatalogModel = pinnedModels.find((model) => model !== vcModel);
+      if (pinnedModels.length > 0 && !pinnedCatalogModel) {
+        throw new TTSModelNotAllowedError(providerId, TTS_PROVIDERS['qwen-tts'].defaultModelId);
+      }
+      // Self-heal persisted VC-model + catalog-voice wedges. Prefer the first
+      // operator-pinned non-VC model, otherwise the catalog default.
+      if (normalizedClientModel === vcModel) {
+        return pinnedCatalogModel || TTS_PROVIDERS['qwen-tts'].defaultModelId;
+      }
+    }
+
+    if (normalizedClientModel) return normalizedClientModel;
+    if (pinnedModels.length > 0) return pinnedModels[0];
+    return undefined;
+  }
+
+  if (pinnedModels.length > 0) return pinnedModels[0];
   return clientModel;
 }
 
@@ -541,9 +863,17 @@ export function resolveTTSModel(providerId: string, clientModel?: string): strin
 // Public API — ASR
 // ---------------------------------------------------------------------------
 
-/** Returns server-configured ASR providers (managed flag only, no base URLs). */
-export function getServerASRProviders(): Record<string, Record<string, never>> {
-  return Object.fromEntries(Object.keys(getConfig().asr).map((id) => [id, {}]));
+/**
+ * Returns ASR providers the client must know about: server-managed providers
+ * (presence = managed flag) plus operator force-disabled providers
+ * (`{ disabled: true }`), mirroring the TTS listing — disable wins (#665).
+ */
+export function getServerASRProviders(): Record<string, { disabled?: boolean }> {
+  const cfg = getConfig();
+  const result: Record<string, { disabled?: boolean }> = {};
+  for (const id of Object.keys(cfg.asr)) result[id] = {};
+  for (const id of cfg.disabled.asr) result[id] = { disabled: true };
+  return result;
 }
 
 export function resolveASRApiKey(providerId: string, clientKey?: string): string {
@@ -552,6 +882,17 @@ export function resolveASRApiKey(providerId: string, clientKey?: string): string
 
 export function resolveASRBaseUrl(providerId: string, clientBaseUrl?: string): string | undefined {
   return resolveSectionBaseUrl('asr', providerId, clientBaseUrl);
+}
+
+/** First operator-configured ASR provider that is not force-disabled. */
+export function resolveServerASRProviderId(): string | undefined {
+  const cfg = getConfig();
+  return Object.keys(cfg.asr).find((id) => !cfg.disabled.asr.has(id));
+}
+
+/** Resolve the asr model, refusing unlisted models on server-managed credentials. */
+export function resolveASRModel(providerId: string, clientModel?: string): string | undefined {
+  return resolveManagedMediaModel('asr', providerId, clientModel);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,14 +916,22 @@ export function resolvePDFBaseUrl(providerId: string, clientBaseUrl?: string): s
 // Public API — Image Generation
 // ---------------------------------------------------------------------------
 
-/** Returns server-configured image providers (allowed models only, no base URLs). */
-export function getServerImageProviders(): Record<string, { models?: string[] }> {
+/**
+ * Returns image providers the client must know about: server-managed providers
+ * (allowed models only, no base URLs) plus operator force-disabled providers
+ * (`{ disabled: true }`), mirroring the TTS listing — disable wins (#665).
+ */
+export function getServerImageProviders(): Record<
+  string,
+  { models?: string[]; disabled?: boolean }
+> {
   const cfg = getConfig();
-  const result: Record<string, { models?: string[] }> = {};
+  const result: Record<string, { models?: string[]; disabled?: boolean }> = {};
   for (const [id, entry] of Object.entries(cfg.image)) {
     result[id] = {};
     if (entry.models && entry.models.length > 0) result[id].models = entry.models;
   }
+  for (const id of cfg.disabled.image) result[id] = { disabled: true };
   return result;
 }
 
@@ -597,13 +946,43 @@ export function resolveImageBaseUrl(
   return resolveSectionBaseUrl('image', providerId, clientBaseUrl);
 }
 
+/**
+ * Resolve the server-side default image provider, used when the client sends
+ * no provider preference: the first operator-configured image provider that is
+ * not force-disabled. Returns undefined when no image provider is enabled at
+ * all (callers fail loud).
+ */
+export function resolveServerImageProviderId(): string | undefined {
+  const disabled = getConfig().disabled.image;
+  return Object.keys(getConfig().image).find((id) => !disabled.has(id));
+}
+
+/** Resolve the image model, refusing unlisted models on server-managed credentials. */
+export function resolveImageModel(providerId: string, clientModel?: string): string | undefined {
+  return resolveManagedMediaModel('image', providerId, clientModel);
+}
+
 // ---------------------------------------------------------------------------
 // Public API — Video Generation
 // ---------------------------------------------------------------------------
 
-/** Returns server-configured video providers (managed flag only, no base URLs). */
-export function getServerVideoProviders(): Record<string, Record<string, never>> {
-  return Object.fromEntries(Object.keys(getConfig().video).map((id) => [id, {}]));
+/**
+ * Returns video providers the client must know about: server-managed providers
+ * (presence = managed flag) plus operator force-disabled providers
+ * (`{ disabled: true }`), mirroring the TTS listing — disable wins (#665).
+ */
+export function getServerVideoProviders(): Record<
+  string,
+  { models?: string[]; disabled?: boolean }
+> {
+  const cfg = getConfig();
+  const result: Record<string, { models?: string[]; disabled?: boolean }> = {};
+  for (const [id, entry] of Object.entries(cfg.video)) {
+    result[id] = {};
+    if (entry.models && entry.models.length > 0) result[id].models = entry.models;
+  }
+  for (const id of cfg.disabled.video) result[id] = { disabled: true };
+  return result;
 }
 
 export function resolveVideoApiKey(providerId: string, clientKey?: string): string {
@@ -617,13 +996,37 @@ export function resolveVideoBaseUrl(
   return resolveSectionBaseUrl('video', providerId, clientBaseUrl);
 }
 
+/**
+ * Resolve the server-side default video provider, used when the client sends
+ * no provider preference: the first operator-configured video provider that is
+ * not force-disabled. Returns undefined when no video provider is enabled at
+ * all (callers fail loud).
+ */
+export function resolveServerVideoProviderId(): string | undefined {
+  const disabled = getConfig().disabled.video;
+  return Object.keys(getConfig().video).find((id) => !disabled.has(id));
+}
+
+/** Resolve the video model, refusing unlisted models on server-managed credentials. */
+export function resolveVideoModel(providerId: string, clientModel?: string): string | undefined {
+  return resolveManagedMediaModel('video', providerId, clientModel);
+}
+
 // ---------------------------------------------------------------------------
 // Public API — Web Search
 // ---------------------------------------------------------------------------
 
-/** Returns server-configured web search providers (managed flag only, no base URLs). */
-export function getServerWebSearchProviders(): Record<string, Record<string, never>> {
-  return Object.fromEntries(Object.keys(getConfig().webSearch).map((id) => [id, {}]));
+/**
+ * Returns web-search providers the client must know about: server-managed
+ * providers (presence = managed flag) plus operator force-disabled providers
+ * (`{ disabled: true }`), mirroring the TTS listing — disable wins (#665).
+ */
+export function getServerWebSearchProviders(): Record<string, { disabled?: boolean }> {
+  const cfg = getConfig();
+  const result: Record<string, { disabled?: boolean }> = {};
+  for (const id of Object.keys(cfg.webSearch)) result[id] = {};
+  for (const id of cfg.disabled.webSearch) result[id] = { disabled: true };
+  return result;
 }
 
 /**
@@ -649,16 +1052,33 @@ export function resolveWebSearchBaseUrl(
   return resolveSectionBaseUrl('webSearch', providerId, clientBaseUrl);
 }
 
+/** Resolve a model-based search provider's authorized model, or the BYOK client's choice. */
+export function resolveWebSearchModel(
+  providerId: string,
+  clientModel?: string,
+): string | undefined {
+  return resolveManagedMediaModel('webSearch', providerId, clientModel);
+}
+
 export function resolveServerWebSearchProviderId(preferredProviderId?: string): string | undefined {
   const webSearch = getConfig().webSearch;
-  if (preferredProviderId && webSearch[preferredProviderId]?.apiKey) {
+  const disabled = getConfig().disabled.webSearch;
+  const enabled = (id: string) => !disabled.has(id);
+  if (
+    preferredProviderId &&
+    enabled(preferredProviderId) &&
+    webSearch[preferredProviderId]?.apiKey
+  ) {
     return preferredProviderId;
   }
-  if (webSearch.tavily?.apiKey) return 'tavily';
-  if (webSearch.bocha?.apiKey) return 'bocha';
-  if (webSearch.baidu?.apiKey) return 'baidu';
-  if (webSearch.minimax?.apiKey) return 'minimax';
-  return Object.keys(webSearch)[0];
+  if (enabled('tavily') && webSearch.tavily?.apiKey) return 'tavily';
+  if (enabled('exa') && webSearch.exa?.apiKey) return 'exa';
+  if (enabled('bocha') && webSearch.bocha?.apiKey) return 'bocha';
+  if (enabled('baidu') && webSearch.baidu?.apiKey) return 'baidu';
+  if (enabled('minimax') && webSearch.minimax?.apiKey) return 'minimax';
+  if (enabled('claude') && webSearch.claude?.apiKey) return 'claude';
+  if (enabled('firecrawl') && webSearch.firecrawl?.apiKey) return 'firecrawl';
+  return Object.keys(webSearch).find(enabled);
 }
 
 /**
@@ -674,4 +1094,44 @@ export function getParallelSceneConcurrency(): number {
   const raw = Number.parseInt(process.env.PARALLEL_SCENE_CONCURRENCY ?? '', 10);
   if (!Number.isFinite(raw) || raw <= 0) return 0;
   return Math.min(raw, 10);
+}
+
+/** Legacy media requests may use only this deployment's capability models. */
+function resolveManagedMediaModel(
+  section: 'tts' | 'asr' | 'image' | 'video' | 'webSearch',
+  providerId: string,
+  clientModel?: string,
+): string | undefined {
+  clientModel = clientModel?.trim() || undefined;
+  const entry = serverEntry(section, providerId);
+  const id = presetIdFor(section as SlotCapability, providerId);
+  if (!entry?.apiKey || !selectsUpstreamModel(id, section)) return clientModel;
+  const deployment = deploymentConfig();
+  if (!deployment.legacy) throw new ModelAuthorizationError();
+  const config = deployment.layer?.config;
+  const model = clientModel ?? deploymentAuthorizedModels(config, id, section)[0];
+  if (model !== undefined) assertDeploymentModelAuthorized(config, id, model, section);
+  else if (clientModel !== undefined || deploymentDefaultModel(id, section))
+    throw new ModelAuthorizationError();
+  return model;
+}
+
+/** The exact legacy setting to declare a provider's authorized model ids. */
+export function providerModelsSetting(
+  section: keyof Omit<ServerConfig, 'disabled'>,
+  providerId: string,
+): string {
+  const maps = {
+    providers: LLM_ENV_MAP,
+    tts: TTS_ENV_MAP,
+    asr: ASR_ENV_MAP,
+    image: IMAGE_ENV_MAP,
+    video: VIDEO_ENV_MAP,
+    webSearch: WEB_SEARCH_ENV_MAP,
+    pdf: PDF_ENV_MAP,
+  };
+  const prefix = Object.entries(maps[section]).find(([, id]) => id === providerId)?.[0];
+  return prefix
+    ? `${prefix}_MODELS or server-providers.yml ${section}.${providerId}.models`
+    : `server-providers.yml ${section}.${providerId}.models`;
 }

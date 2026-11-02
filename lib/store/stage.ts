@@ -15,12 +15,17 @@ import type { SceneOutline } from '@/lib/types/generation';
 import { createLogger } from '@/lib/logger';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useSettingsStore } from '@/lib/store/settings';
+import type { StageManifest } from '@/lib/workbench/stage-freshness';
 import { applyGeneratedAgentsToRegistry } from '@/lib/orchestration/registry/store';
 import { migrateScene } from '@/lib/edit/slide-schema';
 import { preparePBLScenesForDocumentPersistence } from '@/lib/pbl/v2/runtime/document-persistence';
 import { hydratePBLScenesFromRuntime } from '@/lib/pbl/v2/runtime/hydration';
+import { runIdOfCourse } from '@/lib/generation-run-client/run-id';
 import type { ChatStorageSnapshot } from '@/lib/utils/chat-storage';
+import type { DocumentProducer } from '@/lib/document-store/persistence-types';
 import type { PendingChange, StaleDroppedSave } from '@/lib/utils/stage-storage';
+import { collectStageAssetRefs } from '@/lib/media/collect-stage-asset-refs';
+import { reconcileSceneMediaAllocations } from '@/lib/media/reconcile-scene-media';
 import {
   isStageDeleted,
   isStageDeletionInFlight,
@@ -51,8 +56,68 @@ type FlushRound = {
 };
 let flushInFlight: FlushRound | null = null;
 let stageStorageModulePromise: Promise<typeof import('@/lib/utils/stage-storage')> | null = null;
+/**
+ * The storage module once it has loaded. The unload write must start its
+ * requests synchronously, so it cannot wait for the dynamic import; loading a
+ * course loads the module long before there is anything to write.
+ */
+let stageStorageModule: typeof import('@/lib/utils/stage-storage') | null = null;
+
+function loadStageStorageModule(): Promise<typeof import('@/lib/utils/stage-storage')> {
+  stageStorageModulePromise ??= import('@/lib/utils/stage-storage').then(
+    (module) => {
+      stageStorageModule = module;
+      return module;
+    },
+    (error: unknown) => {
+      // A failed chunk load is retried by the next caller, not cached.
+      stageStorageModulePromise = null;
+      throw error;
+    },
+  );
+  return stageStorageModulePromise;
+}
 
 const DEPARTING_STAGE_RETRY_DELAY_MS = 100;
+
+/**
+ * Saves outside the debounced flush that are writing a course right now: the
+ * aggregate `saveToStorage` and the departing-course flush in `setStage`. Both
+ * may write any part of the document from a snapshot older than the queue, so
+ * the unload write treats them like a whole-document flush round.
+ */
+const wholeDocumentSavesInFlight = new Map<string, number>();
+
+function trackWholeDocumentSave<T>(stageId: string, save: Promise<T>): Promise<T> {
+  wholeDocumentSavesInFlight.set(stageId, (wholeDocumentSavesInFlight.get(stageId) ?? 0) + 1);
+  const release = () => {
+    const count = (wholeDocumentSavesInFlight.get(stageId) ?? 1) - 1;
+    if (count > 0) wholeDocumentSavesInFlight.set(stageId, count);
+    else wholeDocumentSavesInFlight.delete(stageId);
+  };
+  return save.finally(release);
+}
+
+/**
+ * Pending entries already handed to a keepalive write that is still in
+ * flight, by key: the revision sent. Such an entry stays queued when another
+ * save is in flight (see `writePendingChangesForUnload`), and this keeps a
+ * second unload event from sending the same revision again.
+ */
+const keepaliveSentRevisions = new Map<string, number>();
+
+const SAVE_DEBOUNCE_MS = 500;
+const SAVE_BACKOFF_MAX_MS = 30_000;
+let consecutiveFlushFailures = 0;
+
+function nextSaveDelayMs(): number {
+  if (consecutiveFlushFailures === 0) return SAVE_DEBOUNCE_MS;
+  return Math.min(SAVE_DEBOUNCE_MS * 2 ** consecutiveFlushFailures, SAVE_BACKOFF_MAX_MS);
+}
+
+function recordFlushOutcome(failed: boolean): void {
+  consecutiveFlushFailures = failed ? consecutiveFlushFailures + 1 : 0;
+}
 
 function pendingChangeKey(change: PendingChange): string {
   return change.kind === 'scene' ? `scene:${change.sceneId}` : change.kind;
@@ -67,20 +132,105 @@ function resetPendingChanges(stageId: string | null = null): void {
   cancelScheduledSave();
   pendingChanges.clear();
   pendingStageId = stageId;
+  consecutiveFlushFailures = 0;
 }
 
 function schedulePendingSave(): void {
+  // Once a write has failed, keep the already-armed backoff timer. Streaming
+  // chat mutations are already represented by the dirty descriptor; rearming
+  // per delta would collapse the backoff to the base cadence or starve it.
+  if (consecutiveFlushFailures > 0 && saveTimer) return;
   cancelScheduledSave();
   saveTimer = setTimeout(() => {
     saveTimer = null;
     void flushStageSave().catch(() => {
       // flushStageSave logs once and retains the pending entries for retry.
     });
-  }, 500);
+  }, nextSaveDelayMs());
 }
+
+/**
+ * The course whose server-side generation run is still producing it. Its
+ * document is read-only to other writers until the run completes (the server
+ * refuses the write with `COURSE_GENERATING`), so its content changes are not
+ * queued for saving; the reading position and chats are written as usual.
+ *
+ * The one learner write to scene content during playback is PBL progress
+ * (`PBLRenderer` → `updateScene`). Its durable home is the PBL runtime store,
+ * not the course document (a document save strips the learner state off the
+ * project after syncing it there), so while the course is fenced that sync
+ * runs on its own, without a document write.
+ */
+let serverGeneratingStageId: string | null = null;
+/** Scenes of the fenced course the learner changed (a server copy must not replace them). */
+const learnerChangedScenes = new Set<string>();
+const learnerRuntimeSyncs = new Map<string, ReturnType<typeof setTimeout>>();
+const LEARNER_RUNTIME_SYNC_DELAY_MS = 500;
+
+/** Fence (or, with null, unfence) the course a generation run is producing. */
+export function setServerGeneratingStage(stageId: string | null): void {
+  if (serverGeneratingStageId === stageId) return;
+  learnerChangedScenes.clear();
+  serverGeneratingStageId = stageId;
+  if (!stageId || pendingStageId !== stageId) return;
+  // Content changes queued before the fence would only be refused: the
+  // learner's scene changes go to their runtime store instead.
+  for (const [key, entry] of [...pendingChanges]) {
+    if (!DOCUMENT_CHANGE_KINDS.has(entry.change.kind)) continue;
+    pendingChanges.delete(key);
+    if (entry.change.kind === 'scene') {
+      learnerChangedScenes.add(entry.change.sceneId);
+      syncLearnerRuntime(stageId, entry.change.sceneId);
+    }
+  }
+}
+
+export function isServerGeneratingStage(stageId: string | undefined | null): boolean {
+  return !!stageId && stageId === serverGeneratingStageId;
+}
+
+/** Whether the learner changed this scene of the fenced course (a server copy must not replace it). */
+export function hasLearnerSceneChange(stageId: string, sceneId: string): boolean {
+  return isServerGeneratingStage(stageId) && learnerChangedScenes.has(sceneId);
+}
+
+/** Write a fenced course's PBL learner progress to its runtime store (no document write). */
+function syncLearnerRuntime(stageId: string, sceneId: string): void {
+  const pending = learnerRuntimeSyncs.get(sceneId);
+  if (pending) clearTimeout(pending);
+  learnerRuntimeSyncs.set(
+    sceneId,
+    setTimeout(() => {
+      learnerRuntimeSyncs.delete(sceneId);
+      const state = useStageStore.getState();
+      if (state.stage?.id !== stageId) return;
+      const scene = state.scenes.find((candidate) => candidate.id === sceneId);
+      if (!scene || scene.content.type !== 'pbl') return;
+      void preparePBLScenesForDocumentPersistence(stageId, [scene]).catch((error) => {
+        log.warn(`Saving the PBL progress of ${sceneId} failed:`, error);
+      });
+    }, LEARNER_RUNTIME_SYNC_DELAY_MS),
+  );
+}
+
+const DOCUMENT_CHANGE_KINDS = new Set<PendingChange['kind']>([
+  'scene',
+  'structure',
+  'stage',
+  'outline',
+]);
 
 function markPendingChanges(stageId: string | undefined, ...changes: PendingChange[]): void {
   if (!stageId || isStageDeleted(stageId)) return;
+  if (isServerGeneratingStage(stageId)) {
+    for (const change of changes) {
+      if (change.kind !== 'scene') continue;
+      learnerChangedScenes.add(change.sceneId);
+      syncLearnerRuntime(stageId, change.sceneId);
+    }
+    changes = changes.filter((change) => !DOCUMENT_CHANGE_KINDS.has(change.kind));
+    if (changes.length === 0) return;
+  }
   if (pendingStageId !== stageId) resetPendingChanges(stageId);
   for (const change of changes) {
     pendingRevision += 1;
@@ -109,6 +259,62 @@ export function markStagePersistenceDirty(changes: PendingChange[]): void {
  */
 export function discardPendingStageChanges(stageId: string): void {
   if (pendingStageId === stageId) resetPendingChanges();
+}
+
+/**
+ * Whether this browser holds a stage-level edit (the roster included) not yet
+ * written, queued or in flight: a server read must not overwrite it.
+ */
+export function hasUnsavedStageEdit(stageId: string): boolean {
+  return snapshotPendingStageChangesForDeletion(stageId).some((change) => change.kind === 'stage');
+}
+
+/** Who teaches a course: the two stage fields a roster write sets. */
+export interface StageRosterValue {
+  readonly agentIds?: readonly string[];
+  readonly generatedAgentConfigs?: readonly GeneratedAgentConfig[];
+}
+
+function rosterOfStage(stage: Stage): StageRosterValue {
+  return {
+    ...(stage.agentIds ? { agentIds: stage.agentIds } : {}),
+    ...(stage.generatedAgentConfigs ? { generatedAgentConfigs: stage.generatedAgentConfigs } : {}),
+  };
+}
+
+/**
+ * Per course, the roster this browser last knew the server to hold: the base
+ * of the roster three-way merge in the freshness sync. A server roster that
+ * differs from it while the shown roster still equals it is a remote change
+ * the classroom takes (even with other stage edits pending, so their flush
+ * carries it); a shown roster that differs from it is a local edit, kept.
+ * Recorded by the sync (when it first sees the course and whenever it applies
+ * or confirms a server roster) and here, after a save that wrote the stage.
+ */
+const serverRosterBase = new Map<string, StageRosterValue>();
+
+export function recordServerRosterBase(stageId: string, roster: StageRosterValue): void {
+  serverRosterBase.set(stageId, roster);
+}
+
+export function forgetServerRosterBase(stageId: string): void {
+  serverRosterBase.delete(stageId);
+}
+
+export function serverRosterBaseOf(stageId: string): StageRosterValue | undefined {
+  return serverRosterBase.get(stageId);
+}
+
+/**
+ * Whether a write of the stage document is on the wire now (a flush round
+ * that carries the stage, or a whole-document save). Its payload was captured
+ * when it started, so a roster applied locally now would not be in it.
+ */
+export function isStageWriteInFlight(stageId: string): boolean {
+  return (
+    (flushInFlight?.stageId === stageId && flushInFlight.dirtySnapshot.has('stage')) ||
+    wholeDocumentSavesInFlight.has(stageId)
+  );
 }
 
 /**
@@ -185,8 +391,8 @@ export function restorePendingStageChanges(
   markPendingChanges(stageId, ...changes, ...fullAggregateRemark);
 }
 
-/** The empty store shape shared by every reset path (epoch bump included). */
-function clearedStageState(state: Pick<StageState, 'generationEpoch'>) {
+/** The empty store shape shared by every reset path. */
+function clearedStageState() {
   return {
     stage: null,
     scenes: [],
@@ -195,11 +401,10 @@ function clearedStageState(state: Pick<StageState, 'generationEpoch'>) {
     chatSnapshot: { sessions: [], restoreMarker: null },
     outlines: [],
     generationComplete: false,
-    generationEpoch: state.generationEpoch + 1,
     generationStatus: 'idle' as const,
-    currentGeneratingOrder: -1,
     failedOutlines: [],
     generatingOutlines: [],
+    generationInterrupted: false,
   };
 }
 
@@ -226,7 +431,7 @@ export function clearStoreForDeletedStage(stageId: string): void {
   // read-side isStageDeleted re-checks before its store writes, not by token
   // invalidation.
   resetPendingChanges();
-  useStageStore.setState((state) => clearedStageState(state));
+  useStageStore.setState(clearedStageState());
   log.info('Evicted deleted stage from the store:', stageId);
 }
 
@@ -249,10 +454,10 @@ function mergeSceneContentForUpdate(
   if (current.type !== 'pbl' || incoming.type !== 'pbl') return incoming;
   const currentPBL = current as PBLContent;
   const incomingPBL = incoming as PBLContent;
-  if ('projectV2' in incomingPBL || !currentPBL.projectV2) return incoming;
   return {
+    ...currentPBL,
     ...incomingPBL,
-    projectV2: currentPBL.projectV2,
+    ...(incomingPBL.projectV2 || !currentPBL.projectV2 ? {} : { projectV2: currentPBL.projectV2 }),
   };
 }
 
@@ -277,18 +482,58 @@ interface StageState {
   // Transient generation state (not persisted)
   generatingOutlines: SceneOutline[];
 
-  // Persisted outlines for resume-on-refresh
+  // Persisted outlines (pending ones show as placeholders)
   outlines: SceneOutline[];
 
-  // Persisted (with outlines): true once generation finished for this stage.
-  // Gates resume-on-mount so an edited finished deck is not regenerated.
+  // Persisted (with outlines): true once generation finished for this stage,
+  // so an edited finished deck shows no pending outlines.
   generationComplete: boolean;
 
+  /**
+   * Viewer-facing ownership facts resolved from the stage-meta sidecar (the
+   * reference's classroom access fields). Defaults are the upstream single-user
+   * ones — `isOwner: true`, `readOnly: false` — so a course that was never
+   * probed (no server sidecar row) stays editable exactly as before; the
+   * sidecar probe overrides them when it answers. These are viewer-scoped and
+   * deliberately NOT persisted with the document.
+   */
+  isOwner: boolean;
+  readOnly: boolean;
+
+  /**
+   * Who produced the current outline ('client' absent / 'server-job'), written
+   * by the workbench stage-freshness sync's delegated initial read. Absent
+   * from the host's original store; the reference carries it so a server-owned
+   * course can be told apart from a client-authored one.
+   */
+  outlineProducer: DocumentProducer | null;
+  /** The producing job's handle (a generation run's id for a course a run generates). */
+  outlineProducerRef: string | null;
+  /**
+   * The course's generation run has not completed: the course is read-only
+   * (no editing, no Pro mode) until it does.
+   */
+  courseGenerating: boolean;
+  /**
+   * The course's pending outlines will never be produced: it was generated in
+   * the browser before generation moved to the server (or its run is gone),
+   * and nothing resumes it. They show as interrupted, not as generating.
+   */
+  generationInterrupted: boolean;
+
   // Transient generation tracking (not persisted)
-  generationEpoch: number;
   generationStatus: 'idle' | 'generating' | 'paused' | 'completed' | 'error';
-  currentGeneratingOrder: number;
   failedOutlines: SceneOutline[];
+
+  // Workbench canvas-freshness projections (Mono #1960 Part 2 port).
+  // The workbench stage-freshness sync records the manifest this browser has
+  // actually rendered (`serverManifestByStage`) and the store's save paths may
+  // bump `stageSyncRequest` when a refused write must converge the baseline
+  // before the next save is judged. Both are written by
+  // `lib/workbench/use-workbench-session.ts` / future ownership slices; the
+  // upstream host's own save paths do not consume them yet.
+  serverManifestByStage: Record<string, StageManifest>;
+  stageSyncRequest: number;
 
   // Actions
   setStage: (stage: Stage) => void;
@@ -301,18 +546,23 @@ interface StageState {
   setChats: (chats: ChatSession[]) => void;
   setMode: (mode: StageMode) => void;
   setToolbarState: (state: ToolbarState) => void;
-  setStageAgents: (configs: GeneratedAgentConfig[]) => void;
-  setGeneratingOutlines: (outlines: SceneOutline[]) => void;
+  /**
+   * Replace the roster. `fromServer`: the server already holds it (the
+   * freshness sync read it back), so the classroom follows it without the
+   * write a local edit makes; `agentIds` then comes along with it.
+   */
+  setStageAgents: (
+    configs: GeneratedAgentConfig[],
+    options?: { readonly fromServer?: boolean; readonly agentIds?: string[] },
+  ) => void;
   setOutlines: (outlines: SceneOutline[]) => void;
   setGenerationComplete: (complete: boolean) => void;
-  /** Mark generation complete iff every outline has a scene and none failed. */
-  markGenerationCompleteIfDone: () => void;
-  setGenerationStatus: (status: 'idle' | 'generating' | 'paused' | 'completed' | 'error') => void;
-  setCurrentGeneratingOrder: (order: number) => void;
-  bumpGenerationEpoch: () => void;
-  addFailedOutline: (outline: SceneOutline) => void;
-  clearFailedOutlines: () => void;
-  retryFailedOutline: (outlineId: string) => void;
+  /**
+   * Apply the stage-meta sidecar's per-viewer facts. `readOnly` follows the
+   * reference's classroom rule: a visitor who is not the owner gets a
+   * read-only classroom.
+   */
+  setViewerAccess: (access: { isOwner: boolean }) => void;
 
   // Getters
   getCurrentScene: () => Scene | null;
@@ -372,8 +622,7 @@ async function persistDirtySnapshot(
   // was taken; a deletion after that moment permanently invalidates this
   // write, even if a same-id restore has since lifted the deleted flag.
   if (isStageWriteStale(stageId, capturedEpoch)) return 'stale-dropped';
-  stageStorageModulePromise ??= import('@/lib/utils/stage-storage');
-  const { saveStageDataIncremental } = await stageStorageModulePromise;
+  const { saveStageDataIncremental } = await loadStageStorageModule();
   const result = await saveStageDataIncremental(
     stageId,
     [...dirtySnapshot.values()].map(({ change }) => change),
@@ -421,10 +670,16 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   generatingOutlines: [],
   outlines: [],
   generationComplete: false,
-  generationEpoch: 0,
+  outlineProducer: null,
+  outlineProducerRef: null,
+  courseGenerating: false,
+  generationInterrupted: false,
+  isOwner: true,
+  readOnly: false,
   generationStatus: 'idle' as const,
-  currentGeneratingOrder: -1,
   failedOutlines: [],
+  serverManifestByStage: {},
+  stageSyncRequest: 0,
 
   // Actions
   setStage: (stage) => {
@@ -448,36 +703,39 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
        * short delay, then logged and dropped so it cannot leak into the next
        * document or block navigation indefinitely.
        */
-      void (async () => {
-        let lastFailedKeys = new Set<string>();
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            const result = await persistDirtySnapshot(
-              departingStageId,
-              departingDirty,
-              departingSnapshot,
-              departingEpoch,
-            );
-            // A fenced drop has nothing to retry: the deletion epoch outlives
-            // any restore, so the retry would be dropped identically. This
-            // departing snapshot is NOT covered by the deletion path's
-            // failed-delete restore (that restore is scoped to the pending
-            // map and an in-flight flush round, which this dirt already
-            // left) — on a failed delete it is fenced and dropped, an
-            // accepted consequence of navigation not being a durability
-            // barrier.
-            if (result === 'stale-dropped') return;
-            lastFailedKeys = result;
-            if (lastFailedKeys.size === 0) return;
-          } catch (error) {
-            if (attempt === 1) throw error;
+      void trackWholeDocumentSave(
+        departingStageId,
+        (async () => {
+          let lastFailedKeys = new Set<string>();
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              const result = await persistDirtySnapshot(
+                departingStageId,
+                departingDirty,
+                departingSnapshot,
+                departingEpoch,
+              );
+              // A fenced drop has nothing to retry: the deletion epoch outlives
+              // any restore, so the retry would be dropped identically. This
+              // departing snapshot is NOT covered by the deletion path's
+              // failed-delete restore (that restore is scoped to the pending
+              // map and an in-flight flush round, which this dirt already
+              // left) — on a failed delete it is fenced and dropped, an
+              // accepted consequence of navigation not being a durability
+              // barrier.
+              if (result === 'stale-dropped') return;
+              lastFailedKeys = result;
+              if (lastFailedKeys.size === 0) return;
+            } catch (error) {
+              if (attempt === 1) throw error;
+            }
+            await delay(DEPARTING_STAGE_RETRY_DELAY_MS);
           }
-          await delay(DEPARTING_STAGE_RETRY_DELAY_MS);
-        }
-        log.warn(
-          `Departing stage ${departingStageId} dropped failed changes after one retry: ${[...lastFailedKeys].join(', ')}`,
-        );
-      })().catch((error) => {
+          log.warn(
+            `Departing stage ${departingStageId} dropped failed changes after one retry: ${[...lastFailedKeys].join(', ')}`,
+          );
+        })(),
+      ).catch((error) => {
         log.error(
           `Failed to flush departing stage ${departingStageId} after one retry; changes were dropped:`,
           error,
@@ -485,15 +743,14 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
       });
     }
     resetPendingChanges(stage.id);
-    set((s) => ({
+    set({
       stage,
       scenes: [],
       currentSceneId: null,
       chats: [],
       chatSnapshot: { sessions: [], restoreMarker: null },
       generationComplete: false,
-      generationEpoch: s.generationEpoch + 1,
-    }));
+    });
     markPendingChanges(stage.id, { kind: 'structure' }, { kind: 'stage' });
   },
 
@@ -524,6 +781,11 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
       );
       return;
     }
+    // Before anything else: a scene whose media was stored while it was still
+    // being built carries placeholders that already have allocated ids waiting
+    // for them. Applying them here, ahead of the structure mark below, is what
+    // keeps the placeholder out of the scene's very first save.
+    reconcileSceneMediaAllocations(scene);
     const scenes = [...get().scenes, migrateScene(scene)];
     // Remove the matching outline from generatingOutlines (match by order)
     const generatingOutlines = get().generatingOutlines.filter((o) => o.order !== scene.order);
@@ -544,8 +806,8 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   insertSceneAfter: (anchorSceneId, scene) => {
     // Pro mode slide management entry point — inserts after the anchor and
     // rebalances `order` so PPTX export / array position stay consistent.
-    // Edit mode is gated against active regeneration (see useEditModeLock),
-    // so rewriting `order` here is safe — no outline matcher is racing us.
+    // Regeneration is gated by the regen lease, so no outline matcher is
+    // racing us here; cross-tab `order` collisions are last-write-wins.
     const currentStage = get().stage;
     if (!currentStage || scene.stageId !== currentStage.id) {
       log.warn(
@@ -578,7 +840,7 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   deleteScene: (sceneId) => {
     // A deck that is complete right now (every outline has a scene) stays
     // complete after a deletion. Capture that BEFORE removing the scene so the
-    // completion (end) page and resume-suppression survive even for decks whose
+    // completion (end) page survives even for decks whose
     // generationComplete flag was never recorded — e.g. generated before the
     // flag existed, or edited without a reload so loadFromStorage's self-heal
     // never ran. Without this, the deletion breaks the scenes===outlines count
@@ -586,19 +848,37 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     const state = get();
     const wasComplete = !state.generationComplete && isDeckComplete(state);
 
-    const scenes = get().scenes.filter((scene) => scene.id !== sceneId);
+    const scenes = state.scenes.filter((scene) => scene.id !== sceneId);
     const currentSceneId = get().currentSceneId;
+    const provisionalAfter = state.stage ? { stage: state.stage, scenes } : null;
+    const beforeRefs = collectStageAssetRefs(
+      state.stage ? { stage: state.stage, scenes: state.scenes } : null,
+    );
+    const afterRefs = collectStageAssetRefs(provisionalAfter);
+    const detachedRefs = new Set(
+      [...beforeRefs.referenced].filter((ref) => !afterRefs.referenced.has(ref)),
+    );
+    let nextStage = state.stage;
+    if (nextStage?.videoManifest && detachedRefs.size > 0) {
+      const nextManifest = Object.fromEntries(
+        Object.entries(nextStage.videoManifest).filter(([ref]) => !detachedRefs.has(ref)),
+      );
+      if (Object.keys(nextManifest).length !== Object.keys(nextStage.videoManifest).length) {
+        nextStage = { ...nextStage, videoManifest: nextManifest };
+      }
+    }
 
     // If deleted scene was current, select next or previous
     if (currentSceneId === sceneId) {
       const index = get().getSceneIndex(sceneId);
       const newIndex = index < scenes.length ? index : scenes.length - 1;
       set({
+        stage: nextStage,
         scenes,
         currentSceneId: scenes[newIndex]?.id || null,
       });
     } else {
-      set({ scenes });
+      set({ stage: nextStage, scenes });
     }
 
     if (wasComplete) get().setGenerationComplete(true);
@@ -606,6 +886,7 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     markPendingChanges(
       get().stage?.id,
       { kind: 'structure' },
+      ...(nextStage !== state.stage ? ([{ kind: 'stage' }] as PendingChange[]) : []),
       ...(currentSceneId === sceneId ? ([{ kind: 'currentScene' }] as PendingChange[]) : []),
     );
   },
@@ -631,14 +912,21 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
 
   setToolbarState: (toolbarState) => set({ toolbarState }),
 
-  setStageAgents: (configs) => {
+  setStageAgents: (configs, options) => {
     const stage = get().stage;
     if (!stage) return;
-    set({ stage: { ...stage, generatedAgentConfigs: configs } });
+    set({
+      stage: {
+        ...stage,
+        generatedAgentConfigs: configs,
+        ...(options?.agentIds ? { agentIds: options.agentIds } : {}),
+      },
+    });
     // The roster is part of the stage document — persistence rides the shared
     // pending-change scheduler like every other stage mutation. The registry
-    // and selection updates below are synchronous in-memory mirrors only.
-    markPendingChanges(stage.id, { kind: 'stage' });
+    // and selection updates below are synchronous in-memory mirrors only. A
+    // roster read back from the server is already stored: no write.
+    if (!options?.fromServer) markPendingChanges(stage.id, { kind: 'stage' });
     applyGeneratedAgentsToRegistry(stage.id, configs);
     // Selection mirror honors provenance (same semantics as
     // restoreAgentSelection): a stage-derived selection tracks the roster
@@ -681,8 +969,6 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     }
   },
 
-  setGeneratingOutlines: (generatingOutlines) => set({ generatingOutlines }),
-
   setOutlines: (outlines) => {
     set({ outlines });
     markPendingChanges(get().stage?.id, { kind: 'outline' });
@@ -694,30 +980,8 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
     void get().saveToStorage();
   },
 
-  markGenerationCompleteIfDone: () => {
-    const { outlines, scenes, failedOutlines, generationComplete } = get();
-    if (generationComplete) return;
-    if (isDeckComplete({ outlines, scenes, failedOutlines })) get().setGenerationComplete(true);
-  },
-
-  setGenerationStatus: (generationStatus) => set({ generationStatus }),
-
-  setCurrentGeneratingOrder: (currentGeneratingOrder) => set({ currentGeneratingOrder }),
-
-  bumpGenerationEpoch: () => set((s) => ({ generationEpoch: s.generationEpoch + 1 })),
-
-  addFailedOutline: (outline) => {
-    const existed = get().failedOutlines.some((o) => o.id === outline.id);
-    if (existed) return;
-    set({ failedOutlines: [...get().failedOutlines, outline] });
-  },
-
-  clearFailedOutlines: () => set({ failedOutlines: [] }),
-
-  retryFailedOutline: (outlineId) => {
-    set({
-      failedOutlines: get().failedOutlines.filter((o) => o.id !== outlineId),
-    });
+  setViewerAccess: ({ isOwner }) => {
+    set({ isOwner, readOnly: !isOwner });
   },
 
   // Getters
@@ -738,84 +1002,94 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   // Storage methods. Returns true on a verified write so callers that gate on
   // durability (e.g. setGenerationComplete) can avoid recording state that
   // outruns the scene data.
-  saveToStorage: async () => {
-    const { stage, scenes, currentSceneId, chats, chatSnapshot, outlines, generationComplete } =
-      get();
-    if (!stage?.id) {
-      log.warn('Cannot save: stage.id is required');
-      return false;
-    }
-
-    // Epoch captured with the state read above: a deletion during the PBL
-    // preparation await below permanently invalidates this write.
-    const capturedEpoch = stageDeletionEpoch(stage.id);
-    const pendingAtStart = new Map(pendingChanges);
-    try {
-      const persistedScenes = await preparePBLScenesForDocumentPersistence(stage.id, scenes);
-      const { saveStageData } = await import('@/lib/utils/stage-storage');
-      const result = await saveStageData(
-        stage.id,
-        {
-          stage,
-          scenes: persistedScenes,
-          currentSceneId,
-          chats,
-          chatSnapshot,
-          outline: {
-            outlines,
-            generationComplete,
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
-          },
-        },
-        capturedEpoch,
-      );
-
-      // An epoch-stale drop persisted nothing: skip every piece of success
-      // bookkeeping. The chatSnapshot must not rebind to a snapshot that
-      // never landed, and the pending map must keep its dirt (the deletion
-      // path owns its discard/restore). Report the write as not durable.
-      if (result === 'stale-dropped') {
-        log.info(`Save dropped by deletion fence for stage ${stage.id}; nothing persisted`);
+  saveToStorage: () => {
+    const run = async (): Promise<boolean> => {
+      const { stage, scenes, currentSceneId, chats, chatSnapshot, outlines, generationComplete } =
+        get();
+      if (!stage?.id) {
+        log.warn('Cannot save: stage.id is required');
         return false;
       }
+      // The run producing this course writes it; the server refuses anyone else.
+      if (isServerGeneratingStage(stage.id)) return false;
 
-      const failedKeys = new Set((result?.failedChanges ?? []).map(pendingChangeKey));
-      if (
-        failedKeys.has('chats') &&
-        pendingStageId === stage.id &&
-        !pendingChanges.has('chats') &&
-        get().stage?.id === stage.id &&
-        get().chats === chats
-      ) {
-        markPendingChanges(stage.id, { kind: 'chats' });
-      }
-      // Bind future saves to the exact chat snapshot this successful write
-      // represented. Keep the restore marker unchanged: a stale no-op after a
-      // restore must remain stale until the editor reloads.
-      if (!failedKeys.has('chats') && get().stage?.id === stage.id && get().chats === chats) {
-        set({
-          chatSnapshot: {
-            sessions: structuredClone(chats),
-            restoreMarker: chatSnapshot.restoreMarker,
+      // Epoch captured with the state read above: a deletion during the PBL
+      // preparation await below permanently invalidates this write.
+      const capturedEpoch = stageDeletionEpoch(stage.id);
+      const pendingAtStart = new Map(pendingChanges);
+      try {
+        const persistedScenes = await preparePBLScenesForDocumentPersistence(stage.id, scenes);
+        const { saveStageData } = await loadStageStorageModule();
+        const result = await saveStageData(
+          stage.id,
+          {
+            stage,
+            scenes: persistedScenes,
+            currentSceneId,
+            chats,
+            chatSnapshot,
+            outline: {
+              outlines,
+              generationComplete,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+            },
           },
-        });
-      }
-      if (pendingStageId === stage.id) {
-        for (const [key, entry] of pendingAtStart) {
-          if (!failedKeys.has(key) && pendingChanges.get(key)?.revision === entry.revision) {
-            pendingChanges.delete(key);
-          }
-        }
-        if (pendingChanges.size === 0) cancelScheduledSave();
-        else schedulePendingSave();
-      }
+          capturedEpoch,
+        );
 
-      return true;
-    } catch (error) {
-      log.error('Failed to save to storage:', error);
-      return false;
-    }
+        // An epoch-stale drop persisted nothing: skip every piece of success
+        // bookkeeping. The chatSnapshot must not rebind to a snapshot that
+        // never landed, and the pending map must keep its dirt (the deletion
+        // path owns its discard/restore). Report the write as not durable.
+        if (result === 'stale-dropped') {
+          log.info(`Save dropped by deletion fence for stage ${stage.id}; nothing persisted`);
+          return false;
+        }
+
+        const failedKeys = new Set((result?.failedChanges ?? []).map(pendingChangeKey));
+        // The server now holds the roster this save wrote.
+        if (!failedKeys.has('stage')) recordServerRosterBase(stage.id, rosterOfStage(stage));
+        if (
+          failedKeys.has('chats') &&
+          pendingStageId === stage.id &&
+          !pendingChanges.has('chats') &&
+          get().stage?.id === stage.id &&
+          get().chats === chats
+        ) {
+          markPendingChanges(stage.id, { kind: 'chats' });
+        }
+        // Bind future saves to the exact chat snapshot this successful write
+        // represented. Keep the restore marker unchanged: a stale no-op after a
+        // restore must remain stale until the editor reloads.
+        if (!failedKeys.has('chats') && get().stage?.id === stage.id && get().chats === chats) {
+          set({
+            chatSnapshot: {
+              sessions: structuredClone(chats),
+              restoreMarker: chatSnapshot.restoreMarker,
+            },
+          });
+        }
+        if (pendingStageId === stage.id) {
+          for (const [key, entry] of pendingAtStart) {
+            if (!failedKeys.has(key) && pendingChanges.get(key)?.revision === entry.revision) {
+              pendingChanges.delete(key);
+            }
+          }
+          if (pendingChanges.size === 0) cancelScheduledSave();
+          else schedulePendingSave();
+        }
+
+        return true;
+      } catch (error) {
+        log.error('Failed to save to storage:', error);
+        return false;
+      }
+    };
+    const stageId = get().stage?.id;
+    // Tracked so an unload during the save knows a whole-document write is
+    // still on its way (see writePendingChangesForUnload).
+    return stageId ? trackWholeDocumentSave(stageId, run()) : run();
   },
 
   loadFromStorage: async (stageId: string, loadToken?: StageSceneLoadToken) => {
@@ -871,8 +1145,8 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
               // flag: the warm state IS the live classroom again (the failure
               // path re-queued the discarded dirt before settling) — keep it.
               // Mirror of the success-path identity guard below: a tokenless
-              // store writer (applyClassroomStageAndScenes via a database
-              // import) can replace the stage during the park without claiming
+              // store writer (a database import applying another classroom)
+              // can replace the stage during the park without claiming
               // the load token, and then there is no warm state of THIS stage
               // left to keep — fall through to the cold load instead of
               // reporting a classroom the store no longer holds as live.
@@ -906,13 +1180,13 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
             log.info('Warm stage is deleted; discarding ghost and reloading:', stageId);
             if (get().stage?.id === stageId) {
               resetPendingChanges();
-              set((s) => clearedStageState(s));
+              set(clearedStageState());
             }
           }
         }
       }
 
-      const { loadStageData } = await import('@/lib/utils/stage-storage');
+      const { loadStageData } = await loadStageStorageModule();
       const data = await loadStageData(stageId);
 
       const outlinesRecord = data?.outline;
@@ -946,25 +1220,34 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
         // Self-heal decks generated before generationComplete was tracked: if
         // every outline already has a matching scene and none failed,
         // generation must have finished, so treat the deck as complete and
-        // persist the flag. This prevents a pre-existing finished deck from
-        // regenerating a slide the user deletes before the flag was ever
-        // recorded.
+        // persist the flag. This keeps a slide the user deletes from a
+        // pre-existing finished deck from showing as a pending outline.
         //
-        // Matching is by `order`, consistent with the rest of the resume
-        // pipeline. For a never-edited deck order is a faithful key; the only
-        // way it diverges is Pro-mode insert/reorder, which is blocked while
+        // Matching is by `order`, as everywhere outlines meet scenes. For a
+        // never-edited deck order is a faithful key; the only way it diverges
+        // is Pro-mode insert/reorder, which is blocked while
         // outlines are still pending (see stage-mode edit gating), so an
         // interrupted deck cannot be edited into a false "all materialized".
         const inMemoryState = get();
         const failedOutlines =
           inMemoryState.stage?.id === stageId ? inMemoryState.failedOutlines : [];
+        // A course a server job produces records its own completion.
+        const serverProduced = outlinesRecord?.producer === 'server-job';
         const generationComplete =
           persistedComplete ||
-          isDeckComplete({
-            outlines,
-            scenes: migrated,
-            failedOutlines,
-          });
+          (!serverProduced &&
+            isDeckComplete({
+              outlines,
+              scenes: migrated,
+              failedOutlines,
+            }));
+        // Compute generatingOutlines from persisted outlines minus completed
+        // scenes. Once generation is complete the deck is frozen for editing,
+        // so an orphaned outline (e.g. from a deleted slide) must NOT surface
+        // as a pending placeholder.
+        const generatingOutlines = generationComplete
+          ? []
+          : outlines.filter((o) => !migrated.some((s) => s.order === o.order));
         set({
           stage: data.stage,
           scenes: migrated,
@@ -973,13 +1256,16 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
           chatSnapshot: data.chatSnapshot ?? { sessions: [], restoreMarker: undefined },
           outlines,
           generationComplete,
-          // Compute generatingOutlines from persisted outlines minus completed
-          // scenes. Once generation is complete the deck is frozen for editing,
-          // so an orphaned outline (e.g. from a deleted slide) must NOT surface
-          // as a pending placeholder or drive resume regeneration.
-          generatingOutlines: generationComplete
-            ? []
-            : outlines.filter((o) => !migrated.some((s) => s.order === o.order)),
+          generatingOutlines,
+          // Export readiness reads the failed outlines too; set them together so a
+          // previous classroom's failures don't carry over.
+          failedOutlines,
+          // A course the browser was generating before generation moved to
+          // the server: no run will produce the rest (a server job's course
+          // is its job's to finish).
+          generationInterrupted: generatingOutlines.length > 0 && !serverProduced,
+          outlineProducer: outlinesRecord?.producer ?? null,
+          outlineProducerRef: outlinesRecord?.producerRef ?? null,
           // `mode` is transient UI state, not persisted with the stage.
           // Reset to 'playback' on every load so SPA navigation between
           // classrooms doesn't carry Pro-mode state across — e.g. user
@@ -989,6 +1275,17 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
           mode: 'playback',
         });
         resetPendingChanges(stageId);
+        // A course its generation run is still producing is read-only from
+        // the moment it is shown (the classroom's run follower lifts it).
+        if (
+          !persistedComplete &&
+          runIdOfCourse(outlinesRecord?.producer, outlinesRecord?.producerRef)
+        ) {
+          setServerGeneratingStage(stageId);
+        } else if (isServerGeneratingStage(stageId)) {
+          // No run to follow: nothing would ever lift the fence.
+          setServerGeneratingStage(null);
+        }
         if (generationComplete && !persistedComplete) void get().saveToStorage();
         log.info('Loaded from storage:', stageId);
       } else {
@@ -1003,7 +1300,7 @@ const useStageStoreBase = create<StageState>()((set, get) => ({
   clearStore: () => {
     claimStageSceneLoadToken();
     resetPendingChanges();
-    set((s) => clearedStageState(s));
+    set(clearedStageState());
     log.info('Store cleared');
   },
 }));
@@ -1064,9 +1361,20 @@ function startFlushRound(): FlushRound | null {
           },
         });
       }
+      if (
+        !staleDropped &&
+        snapshot.stage &&
+        dirtySnapshot.has('stage') &&
+        !failedKeys.has('stage')
+      ) {
+        // The server now holds the roster this round wrote.
+        recordServerRosterBase(stageId, rosterOfStage(snapshot.stage));
+      }
+      recordFlushOutcome(failedKeys.size > 0);
       return failedKeys;
     } catch (error) {
       log.error(`Failed to flush pending stage changes for ${stageId}:`, error);
+      recordFlushOutcome(true);
       throw error;
     } finally {
       flushInFlight = null;
@@ -1131,14 +1439,152 @@ export async function flushStageSave(): Promise<void> {
   throw new Error(`Stage persistence did not quiesce after ${MAX_FLUSH_DRAIN_ROUNDS} flush rounds`);
 }
 
-if (typeof window !== 'undefined') {
-  const kickPendingSave = () => {
-    void flushStageSave().catch(() => {
-      // Best effort during page shutdown; pending dirt remains for a live retry.
+/**
+ * Settle the pending save before leaving the editor, so what the user just
+ * did is on the server before the next screen (or a reload) can ask for it.
+ * Bounded: a stalled request must not hold the user in the editor; whatever
+ * is still pending afterwards stays queued for the regular retry.
+ */
+export async function settlePendingStageSave(timeoutMs = 3_000): Promise<void> {
+  await Promise.race([flushStageSave().catch(() => undefined), delay(timeoutMs)]);
+}
+
+/**
+ * Whether a flush round writes the whole document rather than single rows:
+ * the incremental save takes the aggregate path for a structural or outline
+ * change, or for a batch that spans more than one document category.
+ */
+function roundWritesWholeDocument(round: FlushRound): boolean {
+  const categories = new Set<PendingChange['kind']>();
+  for (const { change } of round.dirtySnapshot.values()) {
+    if (change.kind === 'structure' || change.kind === 'outline') return true;
+    if (DOCUMENT_CHANGE_KINDS.has(change.kind)) categories.add(change.kind);
+  }
+  return categories.size > 1;
+}
+
+/**
+ * Write what is pending while the page unloads; returns true when leaving now
+ * would lose a document change, so `beforeunload` should ask first.
+ *
+ * The regular save reads the document before it writes, and an unload aborts
+ * that read, so the write never leaves the page. Here the pending scene and
+ * stage changes go straight out as keepalive requests (see
+ * `writeStageChangesForUnload`).
+ *
+ * A sent change normally leaves the queue, and comes back if its request
+ * fails while the page is still alive. While another save of the course is in
+ * flight it stays queued instead: that save may land after the keepalive
+ * write with an older copy, and if the user stays (or the page returns from
+ * the back/forward cache) the queued change is written again after it.
+ *
+ * Leaving would lose a change when it could not be sent this way, or when a
+ * save in flight could overwrite the copy sent now with an older one: a
+ * whole-document save (a structural flush round, the aggregate save, the
+ * departing-course flush), or a flush round writing an older revision of the
+ * same scene or stage.
+ */
+export function writePendingChangesForUnload(): boolean {
+  const stageId = pendingStageId;
+  if (!stageId || pendingChanges.size === 0) return false;
+  const state = useStageStore.getState();
+  if (state.stage?.id !== stageId) return false;
+
+  const pendingDocumentEntries = [...pendingChanges].filter(([, entry]) =>
+    DOCUMENT_CHANGE_KINDS.has(entry.change.kind),
+  );
+  const round = flushInFlight?.stageId === stageId ? flushInFlight : null;
+  const wholeDocumentSaveInFlight =
+    (wholeDocumentSavesInFlight.get(stageId) ?? 0) > 0 ||
+    (round !== null && roundWritesWholeDocument(round));
+  const saveInFlight = wholeDocumentSaveInFlight || round !== null;
+  const overtakesInFlightSave = pendingDocumentEntries.some(([key, entry]) => {
+    if (wholeDocumentSaveInFlight) return true;
+    const attempted = round?.dirtySnapshot.get(key);
+    return attempted !== undefined && attempted.revision !== entry.revision;
+  });
+
+  const storage = stageStorageModule;
+  if (!storage) return pendingDocumentEntries.length > 0;
+
+  // Entries whose revision a keepalive write in flight already carries.
+  const entries = new Map(
+    [...pendingChanges].filter(
+      ([key, entry]) => keepaliveSentRevisions.get(key) !== entry.revision,
+    ),
+  );
+  if (entries.size === 0) return overtakesInFlightSave;
+  const snapshot = persistenceSnapshot(state);
+  if (!snapshot.stage) return false;
+  const result = storage.writeStageChangesForUnload(
+    stageId,
+    [...entries.values()].map(({ change }) => change),
+    {
+      stage: snapshot.stage,
+      scenes: snapshot.scenes,
+      currentSceneId: snapshot.currentSceneId,
+      chats: snapshot.chats,
+      chatSnapshot: snapshot.chatSnapshot,
+    },
+    stageDeletionEpoch(stageId),
+  );
+
+  const sentEntries = new Map<string, PendingEntry>();
+  for (const change of result.sent) {
+    const key = pendingChangeKey(change);
+    const entry = entries.get(key);
+    if (!entry) continue;
+    sentEntries.set(key, entry);
+    keepaliveSentRevisions.set(key, entry.revision);
+    if (!saveInFlight) pendingChanges.delete(key);
+  }
+  if (sentEntries.size > 0) {
+    void result.settled.then((succeeded) => {
+      for (const [key, entry] of sentEntries) {
+        if (keepaliveSentRevisions.get(key) === entry.revision) keepaliveSentRevisions.delete(key);
+      }
+      if (succeeded || pendingStageId !== stageId) return;
+      // The page stayed and a write failed: queue the changes again, unless
+      // a newer edit of the same unit is already waiting.
+      for (const [key, entry] of sentEntries) {
+        if (!pendingChanges.has(key)) pendingChanges.set(key, entry);
+      }
+      schedulePendingSave();
     });
-  };
+  }
+  return result.deferred.length > 0 || overtakesInFlightSave;
+}
+
+function kickPendingSave(): void {
+  void flushStageSave().catch(() => {
+    // Best effort during page shutdown; pending dirt remains for a live retry.
+  });
+}
+
+/**
+ * The page's `beforeunload` handler: write what can be written now, and ask
+ * the user to confirm leaving only when a document change would be lost.
+ * Nothing pending, nothing asked.
+ */
+export function handleBeforeUnload(event: Pick<BeforeUnloadEvent, 'preventDefault'>): void {
+  const wouldLoseChanges = writePendingChangesForUnload();
+  // Whatever is left (chats, and anything that could not be sent above)
+  // still gets the regular attempt, which completes if the user stays.
+  kickPendingSave();
+  if (wouldLoseChanges) {
+    event.preventDefault();
+    // Older browsers ask only when returnValue is set.
+    (event as { returnValue?: unknown }).returnValue = '';
+  }
+}
+
+if (typeof window !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') kickPendingSave();
   });
-  window.addEventListener('beforeunload', kickPendingSave);
+  window.addEventListener('beforeunload', handleBeforeUnload);
+  // Mobile browsers often skip beforeunload; pagehide still fires on the way out.
+  window.addEventListener('pagehide', () => {
+    writePendingChangesForUnload();
+  });
 }

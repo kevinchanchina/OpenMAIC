@@ -6,10 +6,12 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { createLogger } from '@/lib/logger';
+import { useI18n } from '@/lib/hooks/use-i18n';
+import { resolveASRLanguage, useSettingsStore } from '@/lib/store/settings';
 
 const log = createLogger('BrowserASR');
 
-// Note: Window.SpeechRecognition declaration is in components/ai-elements/prompt-input.tsx
+// Window.SpeechRecognition constructors are declared in types/web-speech.d.ts.
 
 export type ASRErrorCode =
   | 'not-supported'
@@ -32,10 +34,12 @@ export function useBrowserASR(options: UseBrowserASROptions = {}) {
   const {
     onTranscription,
     onError,
-    language = 'zh-CN',
+    language,
     continuous = false,
     interimResults = false,
   } = options;
+  const { locale } = useI18n();
+  const savedLanguage = useSettingsStore((state) => state.asrLanguage);
 
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
@@ -68,14 +72,13 @@ export function useBrowserASR(options: UseBrowserASROptions = {}) {
       return;
     }
 
-    // Create Speech Recognition instance. The globals are typed by
-    // @assistant-ui/core's speech adapter; cast the instance since its rich shape
-    // (event handlers, lang, continuous, …) isn't in that minimal type.
+    // Cast the instance because its rich shape (event handlers, lang,
+    // continuous, …) is intentionally outside our minimal global declaration.
     const SpeechRecognitionCtor = (window.SpeechRecognition || window.webkitSpeechRecognition)!;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Web Speech API instance shape isn't in lib.dom
     const recognition: any = new SpeechRecognitionCtor();
 
-    recognition.lang = language;
+    recognition.lang = resolveASRLanguage('browser-native', language ?? savedLanguage, locale);
     recognition.continuous = continuous;
     recognition.interimResults = interimResults;
 
@@ -137,7 +140,7 @@ export function useBrowserASR(options: UseBrowserASROptions = {}) {
 
     recognition.start();
     recognitionRef.current = recognition;
-  }, [language, continuous, interimResults]);
+  }, [language, savedLanguage, locale, continuous, interimResults]);
 
   const stopListening = useCallback(() => {
     if (recognitionRef.current) {

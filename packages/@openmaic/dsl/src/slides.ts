@@ -16,6 +16,8 @@
  * Pure types only — no runtime imports, no React/pptx/echarts.
  */
 
+import type { AssetRef } from './storage.js';
+
 /**
  * Regular (not `const`) enum on purpose: consumers compile with
  * `isolatedModules`, under which importing an ambient `const enum` across the
@@ -331,7 +333,12 @@ export interface PPTImageElement extends PPTBaseElement {
   type: 'image';
   /** @default true */
   fixedRatio: boolean;
-  src: string;
+  /**
+   * An asset reference. Legacy documents and import/render paths also store placeholder ids or
+   * concrete URLs here; such values are foreign to the asset pool and are addressed by later
+   * delivery-plan steps.
+   */
+  src: AssetRef;
   outline?: PPTElementOutline;
   filters?: ImageElementFilters;
   clip?: ImageElementClip;
@@ -492,6 +499,47 @@ export type ChartType = 'bar' | 'column' | 'line' | 'pie' | 'ring' | 'area' | 'r
 export interface ChartOptions {
   lineSmooth?: boolean;
   stack?: boolean;
+  /** Plot category shares while retaining original data for labels and editing. */
+  percentStack?: boolean;
+}
+
+/** Explicit imported chart formatting; absent for legacy/authored charts. */
+export type ChartFill =
+  | string
+  | {
+      type: 'linear';
+      x: number;
+      y: number;
+      x2: number;
+      y2: number;
+      colorStops: { offset: number; color: string }[];
+    };
+export interface ImportedChartAxis {
+  show?: boolean;
+  gridlines?: boolean;
+  gridlineColor?: string;
+  lineColor?: string;
+  lineVisible?: boolean;
+  labelVisible?: boolean;
+  labelColor?: string;
+  labelFontSize?: number; // canvas units (import adapter uses points before scaling)
+  labelBold?: boolean;
+  min?: number;
+  max?: number;
+  majorUnit?: number;
+  numberFormat?: string;
+}
+export interface ImportedChartStyle {
+  series: {
+    fill?: ChartFill;
+    pointFills?: Record<string, ChartFill>;
+    pointImages?: Record<string, string>;
+    showValue?: boolean;
+  }[];
+  categoryAxis?: ImportedChartAxis;
+  valueAxis?: ImportedChartAxis;
+  gapWidth?: number;
+  plotArea?: { x: number; y: number; w: number; h: number };
 }
 
 export interface ChartData {
@@ -527,6 +575,7 @@ export interface PPTChartElement extends PPTBaseElement {
   chartType: ChartType;
   data: ChartData;
   options?: ChartOptions;
+  importedStyle?: ImportedChartStyle;
   outline?: PPTElementOutline;
   themeColors: string[];
   textColor?: string;
@@ -728,8 +777,20 @@ export interface PPTLatexElement extends PPTBaseElement {
  */
 export interface PPTVideoElement extends PPTBaseElement {
   type: 'video';
-  src?: string;
-  mediaRef?: string;
+  /**
+   * An asset reference. Legacy documents and render/import paths also store placeholder ids or
+   * concrete URLs here; such values are foreign to the asset pool and are addressed by later
+   * delivery-plan steps. Merging `src` and `mediaRef` is deliberately out of scope for this
+   * type-unification step.
+   */
+  src?: AssetRef;
+  /**
+   * An asset reference for generated video. Legacy documents and generation paths also store
+   * generated-video placeholder ids here; such values are foreign to the asset pool and are
+   * addressed by later delivery-plan steps. Merging `src` and `mediaRef` is deliberately out of
+   * scope for this type-unification step.
+   */
+  mediaRef?: AssetRef;
   autoplay: boolean;
   poster?: string;
   ext?: string;

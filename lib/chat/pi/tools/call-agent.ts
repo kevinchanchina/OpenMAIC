@@ -1,8 +1,10 @@
+import { createAbortableSend } from '../send';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { Type, type Static } from 'typebox';
 import type { LanguageModel } from 'ai';
 import { nanoid } from 'nanoid';
 import { buildAgent } from '@/lib/agent/runtime/build-agent';
+import { runNativeChild } from '@/lib/agent/runtime/run-native-child';
 import { createCallLlmStreamFn } from '@/lib/agent/runtime/stream-fn';
 import {
   createParserState,
@@ -10,22 +12,35 @@ import {
   looksLikeStructuredFragment,
   parseStructuredChunk,
   type ParseResult,
-} from '@/lib/orchestration/stateless-generate';
+} from '@/lib/chat/structured-output';
 import type { AgentConfig } from '@/lib/orchestration/registry/types';
 import type { AgentTurnSummary, WhiteboardActionRecord } from '@/lib/orchestration/types';
 import type { ThinkingConfig } from '@/lib/types/provider';
+import type { ChildRuntimeMode } from '../child-runtime';
 import type { DirectorSceneEvidenceMetadata } from './read-scene';
-import type { DirectorWebEvidenceMetadata } from './web-search';
+import { buildNativeWebSearchTool, type NativeWebSearchConfig } from './web-search';
 import type { ParsedAction, StatelessChatRequest } from '@/lib/types/chat';
 import {
   buildChildPrompt,
   buildChildTurnPrompt,
+  buildNativeChildPrompt,
+  buildNativeChildTurnPrompt,
+  createVisibleSpeechDeltaSanitizer,
   extractLastAssistantText,
   sanitizeVisibleSpeech,
   toHistoryMessages,
 } from '../prompts';
 import type { SendEvent } from '../types';
-import { buildChildActionTools, createPiWhiteboardRuntimeState } from './classroom-actions';
+import {
+  buildChildActionTools,
+  createPiWhiteboardRuntimeState,
+  type PiWhiteboardRuntimeState,
+} from './classroom-actions';
+import { buildNativeSpotlightTool } from './native-spotlight';
+import { buildNativeWhiteboardTools } from './native-whiteboard';
+import { legacyShapeCompatibilityError } from '@/lib/whiteboard/legacy-shape';
+import type { WhiteboardRuntimeService } from '@/lib/whiteboard/runtime/store';
+import type { ElementReferenceEvidence } from '../element-reference';
 
 const CallAgentParams = Type.Object({
   agentId: Type.String({
@@ -38,10 +53,16 @@ const CallAgentParams = Type.Object({
 
 type CallAgentParams = Static<typeof CallAgentParams>;
 
-type RuntimeEvidenceAttachment<TMetadata> = {
+type RuntimeEvidenceAttachment<TMetadata> = Readonly<{
   content: string;
-  metadata: TMetadata;
-};
+  metadata: Readonly<TMetadata>;
+}>;
+
+export type RequestStartCurrentScene = Readonly<{
+  sceneId: string;
+  sceneType: string;
+  elementIds: readonly string[];
+}>;
 
 type ChildActionTool = ReturnType<typeof buildChildActionTools>[number];
 type ChildMessageEvent = {
@@ -57,7 +78,6 @@ type ActionWarning = {
   message: string;
 };
 
-const SHAPE_TYPES = new Set(['rectangle', 'circle', 'triangle']);
 const CHART_TYPES = new Set(['bar', 'column', 'line', 'pie', 'ring', 'area', 'radar', 'scatter']);
 const LINE_STYLES = new Set(['solid', 'dashed']);
 const CODE_EDIT_OPERATIONS = new Set([
@@ -73,6 +93,15 @@ function getAssistantTextDelta(event: ChildMessageEvent): string | null {
   if (!assistantEvent) return null;
   if (assistantEvent.type !== 'text_delta') return null;
   return assistantEvent.delta ?? '';
+}
+
+function abortChildError(...signals: Array<AbortSignal | undefined>): Error {
+  const aborted = signals.find((signal) => signal?.aborted);
+  if (aborted?.reason instanceof Error) return aborted.reason;
+  return new DOMException(
+    typeof aborted?.reason === 'string' ? aborted.reason : 'Operation aborted',
+    'AbortError',
+  );
 }
 
 async function emitTextDelta(opts: {
@@ -266,9 +295,7 @@ function validateActionParams(action: ParsedAction): string | null {
 
   if (action.actionName === 'wb_draw_shape') {
     return (
-      (typeof params.shape === 'string' && SHAPE_TYPES.has(params.shape)
-        ? null
-        : 'wb_draw_shape requires params.shape rectangle|circle|triangle') ??
+      legacyShapeCompatibilityError(params) ??
       validateRequiredPosition(params, 'wb_draw_shape', ['x', 'y', 'width', 'height']) ??
       optionalString(params, 'fillColor', 'wb_draw_shape') ??
       validateOptionalElementId(params, 'wb_draw_shape')
@@ -463,9 +490,12 @@ async function processParseResult(opts: {
   body: StatelessChatRequest;
   appendText: (content: string) => void;
   warn: (warning: ActionWarning) => void;
+  signal: AbortSignal;
 }): Promise<void> {
+  opts.signal.throwIfAborted();
   let emittedOrderedTextCount = 0;
   for (const entry of opts.result.ordered) {
+    opts.signal.throwIfAborted();
     if (entry.type === 'text') {
       const content = opts.result.textChunks[entry.index];
       if (!content) continue;
@@ -489,6 +519,7 @@ async function processParseResult(opts: {
   }
 
   for (let i = emittedOrderedTextCount; i < opts.result.textChunks.length; i += 1) {
+    opts.signal.throwIfAborted();
     const content = opts.result.textChunks[i];
     if (!content) continue;
     await emitTextDelta({
@@ -510,46 +541,40 @@ export function buildCallAgentTool(opts: {
   thinkingConfig: ThinkingConfig;
   maxOutputTokens?: number;
   abortSignal: AbortSignal;
-  maxAgentTurns: number;
-  getAgentTurnCount: () => number;
   getAgentResponses: () => AgentTurnSummary[];
   getWhiteboardLedger: () => WhiteboardActionRecord[];
-  maxActionsPerAgent: number;
   enableWhiteboardTools: boolean;
+  childRuntimeMode?: ChildRuntimeMode;
+  enableNativeChildSpotlight?: boolean;
+  nativeWebSearchConfig?: NativeWebSearchConfig;
+  nativeWhiteboardService?: WhiteboardRuntimeService;
+  nativeWhiteboardStageId?: string;
+  nativeWhiteboardLearnerKey?: string;
+  requestStartManualVisibilityRevision?: number;
+  requestStartCurrentScene?: RequestStartCurrentScene;
   isUserCued?: () => boolean;
   isSessionClosed?: () => boolean;
   takeSceneEvidence?: () => RuntimeEvidenceAttachment<DirectorSceneEvidenceMetadata[]> | undefined;
-  takeWebEvidence?: () => RuntimeEvidenceAttachment<DirectorWebEvidenceMetadata> | undefined;
+  // `metadata` is absent when only area state travels, so no element identity and
+  // no Spotlight authorization can be derived from it.
+  elementReferenceEvidence?: Readonly<{
+    content: string;
+    metadata?: Readonly<ElementReferenceEvidence>;
+  }>;
 }): AgentTool<typeof CallAgentParams> {
-  // Loop-guard (model-agnostic): an empty/errored child turn used to bypass onAgentDone,
-  // so the completed-turn count never advanced and the maxAgentTurns guard was defeated — a model
-  // that returns empty completions (e.g. reasoning eats the output budget) could then trigger
-  // unbounded call_agent retries. Track attempts + consecutive empties and stop deterministically.
-  const MAX_CONSECUTIVE_EMPTY_TURNS = 2;
-  const maxAgentAttempts = Math.max(opts.maxAgentTurns * 3, opts.maxAgentTurns + 3);
-  let consecutiveEmptyTurns = 0;
-  let totalAgentAttempts = 0;
-  const whiteboardState = createPiWhiteboardRuntimeState(opts.body);
+  let whiteboardState: PiWhiteboardRuntimeState | undefined;
+  const getLegacyWhiteboardState = () => {
+    whiteboardState ??= createPiWhiteboardRuntimeState(opts.body);
+    return whiteboardState;
+  };
   return {
     name: 'call_agent',
     label: 'Call classroom agent',
-    description: `Ask one classroom agent to produce the next in-class response. Use this before giving your final director decision. Hard limit: at most ${opts.maxAgentTurns} classroom agent turns in this server-side loop. Once the limit is reached, finish with cue_user or close_session.`,
+    description:
+      'Ask one classroom agent to produce the next in-class response. Use this before giving your final director decision.',
     parameters: CallAgentParams,
     executionMode: 'sequential',
     execute: async (_toolCallId: string, params: CallAgentParams, signal?: AbortSignal) => {
-      if (totalAgentAttempts >= maxAgentAttempts) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Reached the hard call_agent attempt cap (${maxAgentAttempts}). Finish with cue_user or close_session.`,
-            },
-          ],
-          details: { skipped: true, reason: 'agent_attempt_cap', totalAgentAttempts },
-        };
-      }
-      totalAgentAttempts += 1;
-
       if (opts.isSessionClosed?.()) {
         return {
           content: [
@@ -593,122 +618,275 @@ export function buildCallAgentTool(opts: {
         };
       }
 
-      if (opts.getAgentTurnCount() >= opts.maxAgentTurns) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Agent turn limit (${opts.maxAgentTurns}) reached. Finish the director loop with cue_user or close_session.`,
-            },
-          ],
-          details: {
-            skipped: true,
-            reason: 'agent_turn_limit',
-            maxAgentTurns: opts.maxAgentTurns,
-          },
-        };
-      }
-
-      if (consecutiveEmptyTurns >= MAX_CONSECUTIVE_EMPTY_TURNS) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Classroom agents returned empty responses ${consecutiveEmptyTurns} times in a row. Stop calling agents and finish with cue_user or close_session.`,
-            },
-          ],
-          details: { skipped: true, reason: 'consecutive_empty_turns', consecutiveEmptyTurns },
-        };
-      }
-
-      // Evidence is request-scoped and belongs to exactly one valid child delegation.
-      // Take it before starting/building the child so any downstream failure cannot
-      // leak the packet to a later agent.
+      // read_scene evidence remains pending/take-once. Selected-element evidence is
+      // immutable request context and is attached to every valid child delegation,
+      // including retries and handoffs after an earlier child failure.
       const sceneEvidence = opts.takeSceneEvidence?.();
-      const webEvidence = opts.takeWebEvidence?.();
+      const elementReferenceEvidence = opts.elementReferenceEvidence;
+      const capturedScene = opts.requestStartCurrentScene;
+      const hasMatchingCurrentSceneEvidence = Boolean(
+        capturedScene &&
+        capturedScene.sceneType === 'slide' &&
+        sceneEvidence?.metadata.some(
+          (metadata) =>
+            metadata.sceneId === capturedScene.sceneId && metadata.sceneType === 'slide',
+        ),
+      );
+      const spotlightElementIds = hasMatchingCurrentSceneEvidence
+        ? [...(capturedScene?.elementIds ?? [])]
+        : [];
+      if (
+        capturedScene &&
+        elementReferenceEvidence?.metadata?.kind === 'slide_element' &&
+        elementReferenceEvidence.metadata.sceneId === capturedScene.sceneId &&
+        !spotlightElementIds.includes(elementReferenceEvidence.metadata.elementId)
+      ) {
+        spotlightElementIds.push(elementReferenceEvidence.metadata.elementId);
+      }
 
       const childAbort = new AbortController();
-      const abortChild = () => childAbort.abort();
-      opts.abortSignal.addEventListener('abort', abortChild, { once: true });
-      signal?.addEventListener('abort', abortChild, { once: true });
+      const abortFromRequest = () => childAbort.abort(opts.abortSignal.reason);
+      const abortFromTool = () => childAbort.abort(signal?.reason);
+      if (opts.abortSignal.aborted) abortFromRequest();
+      else opts.abortSignal.addEventListener('abort', abortFromRequest, { once: true });
+      if (signal?.aborted) abortFromTool();
+      else signal?.addEventListener('abort', abortFromTool, { once: true });
+      const send = createAbortableSend(opts.send, childAbort.signal);
+      try {
+        childAbort.signal.throwIfAborted();
+        const messageId = nanoid();
+        let text = '';
+        let actionCount = 0;
+        let sawStructuredOutput = false;
+        const whiteboardActions: WhiteboardActionRecord[] = [];
+        const actionWarnings: ActionWarning[] = [];
+        const warn = (warning: ActionWarning) => {
+          if (
+            actionWarnings.some(
+              (existing) =>
+                existing.reason === warning.reason &&
+                existing.actionName === warning.actionName &&
+                existing.message === warning.message,
+            )
+          ) {
+            return;
+          }
+          actionWarnings.push(warning);
+        };
 
-      const messageId = nanoid();
-      let text = '';
-      let actionCount = 0;
-      let sawStructuredOutput = false;
-      const whiteboardActions: WhiteboardActionRecord[] = [];
-      const actionWarnings: ActionWarning[] = [];
-      const warn = (warning: ActionWarning) => {
-        if (
-          actionWarnings.some(
-            (existing) =>
-              existing.reason === warning.reason &&
-              existing.actionName === warning.actionName &&
-              existing.message === warning.message,
-          )
-        ) {
-          return;
+        await send({
+          type: 'agent_start',
+          data: {
+            messageId,
+            agentId: agent.id,
+            agentName: agent.name,
+            agentAvatar: agent.avatar,
+            agentColor: agent.color,
+          },
+        });
+
+        const childRuntimeMode = opts.childRuntimeMode ?? 'legacy';
+        if (childRuntimeMode === 'native') {
+          const spotlightTargets = new Set(spotlightElementIds);
+          const spotlightEnabled = Boolean(
+            opts.enableNativeChildSpotlight &&
+            agent.allowedActions.includes('spotlight') &&
+            spotlightTargets.size > 0,
+          );
+          const nativeTools: AgentTool[] = [
+            ...(spotlightEnabled
+              ? [
+                  buildNativeSpotlightTool({
+                    agent,
+                    messageId,
+                    send,
+                    authorizedElementIds: spotlightTargets,
+                  }),
+                ]
+              : []),
+            ...(opts.nativeWhiteboardService &&
+            opts.nativeWhiteboardStageId &&
+            opts.nativeWhiteboardLearnerKey
+              ? buildNativeWhiteboardTools({
+                  agent,
+                  messageId,
+                  send,
+                  service: opts.nativeWhiteboardService,
+                  stageId: opts.nativeWhiteboardStageId,
+                  learnerKey: opts.nativeWhiteboardLearnerKey,
+                  requestStartManualVisibilityRevision:
+                    opts.requestStartManualVisibilityRevision ?? 0,
+                })
+              : []),
+            buildNativeWebSearchTool({ config: opts.nativeWebSearchConfig }),
+          ];
+          const availableToolNames = nativeTools.map((tool) => tool.name);
+          const sanitizeNativeDelta = createVisibleSpeechDeltaSanitizer();
+          const nativeResult = await runNativeChild({
+            streamFn: createCallLlmStreamFn({
+              languageModel: opts.languageModel,
+              source: 'pi-chat-native-child',
+              thinkingConfig: opts.thinkingConfig,
+              maxOutputTokens: opts.maxOutputTokens,
+              abortSignal: childAbort.signal,
+            }),
+            systemPrompt: buildNativeChildPrompt(
+              opts.body,
+              agent,
+              opts.getAgentResponses(),
+              availableToolNames,
+              capturedScene,
+            ),
+            prompt: buildNativeChildTurnPrompt(params.instruction, agent.role, {
+              scene: sceneEvidence?.content,
+              element: elementReferenceEvidence?.content,
+              spotlightElementIds,
+            }),
+            tools: nativeTools,
+            allowedToolNames: new Set(availableToolNames),
+            history: toHistoryMessages(opts.body.messages),
+            abortSignal: childAbort.signal,
+            timeoutMs: 60_000,
+            maxProviderTransports: 5,
+            onVisibleTextDelta: async (delta) => {
+              const visibleDelta = sanitizeNativeDelta(delta);
+              if (!visibleDelta) return '';
+              await send({ type: 'text_delta', data: { content: visibleDelta, messageId } });
+              return visibleDelta;
+            },
+            onDispatchedAction: () => {
+              actionCount += 1;
+              opts.onActionDone();
+            },
+          });
+          if (nativeResult.status === 'cancelled' || opts.abortSignal.aborted || signal?.aborted) {
+            throw abortChildError(opts.abortSignal, signal);
+          }
+
+          const finalText = nativeResult.visibleOutput.trim();
+          const isCompleted = nativeResult.status === 'completed';
+          await send({ type: 'agent_end', data: { messageId, agentId: agent.id } });
+          childAbort.signal.throwIfAborted();
+          opts.onAgentDone({
+            agentId: agent.id,
+            agentName: agent.name,
+            contentPreview: finalText.slice(0, 300),
+            actionCount,
+            whiteboardActions,
+            actionWarnings: [],
+          });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `${agent.name}: ${finalText || '(no visible response)'}`,
+              },
+            ],
+            details: {
+              agentId: agent.id,
+              agentName: agent.name,
+              text: finalText,
+              runtimeMode: childRuntimeMode,
+              availableToolNames,
+              nativeChildRun: nativeResult,
+              ...(sceneEvidence ? { sceneEvidence: sceneEvidence.metadata } : {}),
+              ...(elementReferenceEvidence?.metadata
+                ? {
+                    elementReferenceEvidence: elementReferenceEvidence.metadata,
+                  }
+                : {}),
+            },
+            ...(isCompleted ? {} : { isError: true }),
+          };
         }
-        actionWarnings.push(warning);
-      };
 
-      await opts.send({
-        type: 'agent_start',
-        data: {
-          messageId,
-          agentId: agent.id,
-          agentName: agent.name,
-          agentAvatar: agent.avatar,
-          agentColor: agent.color,
-        },
-      });
-
-      const childTools = buildChildActionTools({
-        body: opts.body,
-        agent,
-        messageId,
-        send: opts.send,
-        onActionDone: (record) => {
-          actionCount += 1;
-          if (record) whiteboardActions.push(record);
-          opts.onActionDone(record);
-        },
-        maxActionsPerAgent: opts.maxActionsPerAgent,
-        enableWhiteboardTools: opts.enableWhiteboardTools,
-        whiteboardState,
-      });
-      const childToolsByName = new Map(childTools.map((tool) => [tool.name, tool]));
-
-      const child = buildAgent({
-        streamFn: createCallLlmStreamFn({
-          languageModel: opts.languageModel,
-          source: 'pi-chat-child',
-          thinkingConfig: opts.thinkingConfig,
-          maxOutputTokens: opts.maxOutputTokens,
-          abortSignal: childAbort.signal,
-        }),
-        systemPrompt: buildChildPrompt(
-          opts.body,
+        const childTools = buildChildActionTools({
+          body: opts.body,
           agent,
-          opts.getAgentResponses(),
-          opts.getWhiteboardLedger(),
-          childTools.map((tool) => tool.name),
-        ),
-        tools: [],
-        allowedToolNames: new Set(),
-        history: toHistoryMessages(opts.body.messages),
-      });
-
-      const parserState = createParserState();
-      const unsubscribe = child.subscribe(async (event) => {
-        const delta = getAssistantTextDelta(event);
-        if (!delta) return;
-        sawStructuredOutput = sawStructuredOutput || delta.includes('[');
-        const result = parseStructuredChunk(delta, parserState);
-        await processParseResult({
-          result,
           messageId,
-          send: opts.send,
+          send,
+          abortSignal: childAbort.signal,
+          onActionDone: (record) => {
+            actionCount += 1;
+            if (record) whiteboardActions.push(record);
+            opts.onActionDone(record);
+          },
+          enableWhiteboardTools: opts.enableWhiteboardTools,
+          whiteboardState: getLegacyWhiteboardState(),
+          ...(elementReferenceEvidence?.metadata?.kind === 'slide_element'
+            ? { authorizedSpotlightElementIds: new Set(spotlightElementIds) }
+            : {}),
+        });
+        const childToolsByName = new Map(childTools.map((tool) => [tool.name, tool]));
+
+        const child = buildAgent({
+          streamFn: createCallLlmStreamFn({
+            languageModel: opts.languageModel,
+            source: 'pi-chat-child',
+            thinkingConfig: opts.thinkingConfig,
+            maxOutputTokens: opts.maxOutputTokens,
+            abortSignal: childAbort.signal,
+          }),
+          systemPrompt: buildChildPrompt(
+            opts.body,
+            agent,
+            opts.getAgentResponses(),
+            opts.getWhiteboardLedger(),
+            childTools.map((tool) => tool.name),
+          ),
+          tools: [],
+          allowedToolNames: new Set(),
+          history: toHistoryMessages(opts.body.messages),
+        });
+
+        const abortChild = () => child.abort();
+        childAbort.signal.addEventListener('abort', abortChild, { once: true });
+        const parserState = createParserState();
+        const unsubscribe = child.subscribe(async (event) => {
+          const delta = getAssistantTextDelta(event);
+          if (!delta) return;
+          sawStructuredOutput = sawStructuredOutput || delta.includes('[');
+          const result = parseStructuredChunk(delta, parserState);
+          await processParseResult({
+            result,
+            signal: childAbort.signal,
+            messageId,
+            send,
+            toolsByName: childToolsByName,
+            body: opts.body,
+            appendText: (content) => {
+              text += content;
+            },
+            warn,
+          });
+        });
+
+        try {
+          childAbort.signal.throwIfAborted();
+          await child.prompt(
+            buildChildTurnPrompt(params.instruction, agent.role, {
+              scene: sceneEvidence?.content,
+              element: elementReferenceEvidence?.content,
+            }),
+          );
+          await child.waitForIdle();
+          childAbort.signal.throwIfAborted();
+        } catch (error) {
+          // Preserve the Legacy result lifecycle for failures; cancellation must
+          // not finalize or report the partial response as a completed turn.
+          if (childAbort.signal.aborted) throw error;
+        } finally {
+          unsubscribe();
+          childAbort.signal.removeEventListener('abort', abortChild);
+        }
+
+        childAbort.signal.throwIfAborted();
+        await processParseResult({
+          result: finalizeParser(parserState),
+          signal: childAbort.signal,
+          messageId,
+          send,
           toolsByName: childToolsByName,
           body: opts.body,
           appendText: (content) => {
@@ -716,93 +894,62 @@ export function buildCallAgentTool(opts: {
           },
           warn,
         });
-      });
 
-      let childErrored = false;
-      try {
-        await child.prompt(
-          buildChildTurnPrompt(params.instruction, agent.role, {
-            scene: sceneEvidence?.content,
-            web: webEvidence?.content,
-          }),
-        );
-        await child.waitForIdle();
-      } catch (error) {
-        // Propagate genuine aborts; otherwise treat a failed child run as an empty turn
-        // so it still records via onAgentDone below (counts toward the turn/retry budget)
-        // instead of throwing out of execute and skipping the counter.
-        if (opts.abortSignal.aborted || signal?.aborted) throw error;
-        childErrored = true;
-      } finally {
-        unsubscribe();
-        opts.abortSignal.removeEventListener('abort', abortChild);
-        signal?.removeEventListener('abort', abortChild);
-      }
-
-      await processParseResult({
-        result: finalizeParser(parserState),
-        messageId,
-        send: opts.send,
-        toolsByName: childToolsByName,
-        body: opts.body,
-        appendText: (content) => {
-          text += content;
-        },
-        warn,
-      });
-
-      const emittedText = text.trim();
-      const fallbackText = sawStructuredOutput
-        ? ''
-        : sanitizeVisibleSpeech(extractLastAssistantText(child.state.messages)).trim();
-      // Bug 2 guard: only count a turn as real teaching when it produced genuine
-      // visible speech. Two distinct sources need different trust levels:
-      //   - `emittedText`: already streamed through processParseResult, where every
-      //     chunk was structurally filtered (isLikelyRawStructuredFallback). It is
-      //     trusted speech — re-running the residue classifier over the whole
-      //     accumulated string would misjudge a real turn that merely *discusses*
-      //     JSON/code/brackets as empty, so we do NOT re-classify it.
-      //   - `fallbackText`: the raw last-assistant message, which bypassed the
-      //     parser entirely, so it still needs the structural backstop.
-      // A turn with no trusted speech falls through to the empty-turn guard so the
-      // director does not cue_user / switch agents on half a sentence. This does
-      // NOT touch the drain lifecycle (waitForIdle -> finalizeParser -> agent_end);
-      // it only classifies the already-drained result.
-      const safeFallback =
-        fallbackText && !isLikelyRawStructuredFallback(fallbackText) ? fallbackText : '';
-      const finalText = emittedText || safeFallback;
-      const hasVisibleText = finalText.length > 0;
-      if (finalText && !emittedText) {
-        await opts.send({ type: 'text_delta', data: { content: finalText, messageId } });
-      }
-      const isEmptyTurn = childErrored || (!hasVisibleText && actionCount === 0);
-      consecutiveEmptyTurns = isEmptyTurn ? consecutiveEmptyTurns + 1 : 0;
-      await opts.send({ type: 'agent_end', data: { messageId, agentId: agent.id } });
-      opts.onAgentDone({
-        agentId: agent.id,
-        agentName: agent.name,
-        contentPreview: finalText.slice(0, 300),
-        actionCount,
-        whiteboardActions,
-        actionWarnings,
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `${agent.name}: ${finalText || '(no visible response)'}`,
-          },
-        ],
-        details: {
+        const emittedText = text.trim();
+        const fallbackText = sawStructuredOutput
+          ? ''
+          : sanitizeVisibleSpeech(extractLastAssistantText(child.state.messages)).trim();
+        // Only report genuine visible speech in the result. Two distinct sources need different trust levels:
+        //   - `emittedText`: already streamed through processParseResult, where every
+        //     chunk was structurally filtered (isLikelyRawStructuredFallback). It is
+        //     trusted speech — re-running the residue classifier over the whole
+        //     accumulated string would misjudge a real turn that merely *discusses*
+        //     JSON/code/brackets as empty, so we do NOT re-classify it.
+        //   - `fallbackText`: the raw last-assistant message, which bypassed the
+        //     parser entirely, so it still needs the structural backstop.
+        // This only classifies the already-drained result; the Director decides
+        // whether another classroom response is useful.
+        const safeFallback =
+          fallbackText && !isLikelyRawStructuredFallback(fallbackText) ? fallbackText : '';
+        const finalText = emittedText || safeFallback;
+        if (finalText && !emittedText) {
+          await send({ type: 'text_delta', data: { content: finalText, messageId } });
+        }
+        await send({ type: 'agent_end', data: { messageId, agentId: agent.id } });
+        childAbort.signal.throwIfAborted();
+        opts.onAgentDone({
           agentId: agent.id,
           agentName: agent.name,
-          text: finalText,
+          contentPreview: finalText.slice(0, 300),
+          actionCount,
+          whiteboardActions,
           actionWarnings,
-          ...(sceneEvidence ? { sceneEvidence: sceneEvidence.metadata } : {}),
-          ...(webEvidence ? { webEvidence: webEvidence.metadata } : {}),
-        },
-      };
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${agent.name}: ${finalText || '(no visible response)'}`,
+            },
+          ],
+          details: {
+            agentId: agent.id,
+            agentName: agent.name,
+            text: finalText,
+            actionWarnings,
+            ...(sceneEvidence ? { sceneEvidence: sceneEvidence.metadata } : {}),
+            ...(elementReferenceEvidence?.metadata
+              ? {
+                  elementReferenceEvidence: elementReferenceEvidence.metadata,
+                }
+              : {}),
+          },
+        };
+      } finally {
+        opts.abortSignal.removeEventListener('abort', abortFromRequest);
+        signal?.removeEventListener('abort', abortFromTool);
+      }
     },
   };
 }

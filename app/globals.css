@@ -1,11 +1,14 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @import 'shadcn/tailwind.css';
+/* Workbench chat (agent workbench surface): scoped .wbchat tokens + prose skin. */
+@import '../components/workbench/chat/workbench-chat.css';
 
 /* Streamdown (AI sidebar markdown) styles itself with Tailwind utilities —
    Tailwind must scan its dist so those classes get generated. */
 @source '../node_modules/streamdown/dist/*.js';
 @source '../node_modules/@streamdown/code/dist/*.js';
+@source '../node_modules/@streamdown/math/dist/*.js';
 @source "../node_modules/@openmaic/renderer/dist/**/*.{js,cjs}";
 /* slide-renderer-demo is gitignored (local sandbox), which makes Tailwind v4's
    auto source detection skip it. Re-include it explicitly so the demo's
@@ -58,6 +61,11 @@
 }
 
 :root {
+  /* Inter is loaded from @fontsource in app/layout.tsx, which declares one
+     @font-face per unicode subset. Previously this came from next/font wrapping
+     a single latin-only file, which left Cyrillic and Vietnamese text to OS
+     fallback fonts. */
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -157,6 +165,15 @@
 /* ProseMirror Editor Styles */
 .prosemirror-editor {
   cursor: text;
+}
+
+/* ProseMirror inserts this zero-size caret helper after inline atoms.
+   Tailwind preflight sets `img { display: block }`, which would open a new
+   line. Playback's text element does not use `.prosemirror-editor`. */
+.prosemirror-editor img.ProseMirror-separator {
+  display: inline !important;
+  border: none !important;
+  margin: 0 !important;
 }
 
 /* The slide editor draws a text element's frame via the renderer's Operate
@@ -567,4 +584,12 @@ body[data-maic-editor='true'] .editable-element-text li,
     color: var(--muted-foreground);
     -webkit-text-fill-color: var(--muted-foreground);
   }
+}
+
+/* Opt in at fixed edges; do not pad the body or double-count in nested panels. */
+:root {
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
 }

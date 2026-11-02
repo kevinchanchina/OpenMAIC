@@ -24,11 +24,32 @@ import type {
   RuntimeStore,
   RuntimeTailOptions,
 } from '../runtime/types.js';
-import { RuntimeAppendConflictError } from '../runtime/types.js';
+import {
+  RuntimeAppendConflictError,
+  RuntimeSessionExistsError,
+  RuntimeStageNotFoundError,
+} from '../runtime/types.js';
 import type { Scene, Stage } from '@openmaic/dsl';
 import type { DocumentStore, SceneLike } from '../document/types.js';
+import type { AssetPrincipal, AssetStore } from '../asset/types.js';
+import { createAssetHttpHandler, type AssetHttpHandlerOptions } from './asset.js';
 import { createDocumentHttpHandler, type DocumentHttpHandlerOptions } from './document.js';
 import { assertMaxBodyBytes, DEFAULT_MAX_BODY_BYTES, readJsonObject } from './read-json.js';
+import { storePolicyResponse } from '../store-errors.js';
+
+export {
+  createAssetHttpHandler,
+  DEFAULT_MAX_ASSET_BYTES,
+  DEFAULT_MAX_ASSET_META_BYTES,
+  DEFAULT_MAX_ASSET_PARTS,
+  DEFAULT_MAX_ASSET_REQUEST_BYTES,
+  DEFAULT_SIGNED_URL_TTL_SECONDS,
+  type AssetByteEgress,
+  type AssetIndirectByteEgress,
+  type AssetHttpAuthenticate,
+  type AssetHttpAuthorize,
+  type AssetHttpHandlerOptions,
+} from './asset.js';
 
 export {
   createDocumentHttpHandler,
@@ -88,8 +109,13 @@ class RuntimeHttpError extends Error {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json' });
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): void {
+  res.writeHead(status, { 'content-type': 'application/json', ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -337,7 +363,37 @@ function parsePath(req: IncomingMessage): { parts: string[]; url: URL } {
   }
 }
 
-function mappedError(error: unknown): { status: number; body: ErrorBody } {
+function isSessionExists(error: unknown): boolean {
+  if (error instanceof RuntimeSessionExistsError) return true;
+  return (
+    error instanceof Error &&
+    error.name === 'RuntimeSessionExistsError' &&
+    (error as { code?: unknown }).code === 'SESSION_ALREADY_EXISTS'
+  );
+}
+
+function isStageNotFound(error: unknown): boolean {
+  if (error instanceof RuntimeStageNotFoundError) return true;
+  return (
+    error instanceof Error &&
+    error.name === 'RuntimeStageNotFoundError' &&
+    (error as { code?: unknown }).code === 'STAGE_NOT_FOUND'
+  );
+}
+
+function mappedError(error: unknown): {
+  status: number;
+  body: ErrorBody;
+  headers?: Record<string, string>;
+} {
+  const policy = storePolicyResponse(error);
+  if (policy) {
+    return {
+      status: policy.status,
+      body: { error: { code: policy.code, message: policy.message } },
+      headers: policy.headers,
+    };
+  }
   if (error instanceof RuntimeAppendConflictError) {
     return {
       status: 409,
@@ -352,6 +408,12 @@ function mappedError(error: unknown): { status: number; body: ErrorBody } {
           },
         },
       },
+    };
+  }
+  if (isStageNotFound(error)) {
+    return {
+      status: 404,
+      body: { error: { code: 'STAGE_NOT_FOUND', message: '@openmaic/storage: stage not found' } },
     };
   }
   if (error instanceof RuntimeHttpError && error.status < 500) {
@@ -425,9 +487,12 @@ async function route(
       { ...init, runtimeDslVersion: RUNTIME_DSL_VERSION },
       `runtime session ${JSON.stringify(init.id)}`,
     );
+    // A taken id answers 409 whoever holds it. Session ids are one global key
+    // space, so a create over a taken id fails either way; checking the
+    // holder first would answer 403 for another learner's session and 409 for
+    // one's own, telling a caller whose sessions exist.
     const existing = await store.getSession(init.id);
     if (existing !== undefined) {
-      requireLearner(principal, existing.learnerKey);
       throw new RuntimeHttpError(
         409,
         'SESSION_ALREADY_EXISTS',
@@ -440,8 +505,9 @@ async function route(
       // A post-failure existence check classifies duplicate races without
       // depending on a database driver's message text.
       const raced = await store.getSession(init.id);
-      if (raced !== undefined) {
-        requireLearner(principal, raced.learnerKey);
+      // The store's own taken-id refusal is authoritative: the re-read above
+      // can miss a holder a host-side wrapper hides from reads.
+      if (raced !== undefined || isSessionExists(error)) {
         throw new RuntimeHttpError(
           409,
           'SESSION_ALREADY_EXISTS',
@@ -676,12 +742,13 @@ export function createRuntimeHttpHandler(
       }
       if (
         (!(error instanceof RuntimeHttpError) || error.status >= 500) &&
-        !(error instanceof RuntimeAppendConflictError)
+        !(error instanceof RuntimeAppendConflictError) &&
+        !isStageNotFound(error)
       ) {
         console.error('@openmaic/storage: Runtime HTTP handler internal error', error);
       }
       const mapped = mappedError(error);
-      sendJson(res, mapped.status, mapped.body);
+      sendJson(res, mapped.status, mapped.body, mapped.headers);
     });
   };
 }
@@ -689,31 +756,67 @@ export function createRuntimeHttpHandler(
 export interface StorageHttpHandlerOptions
   extends
     RuntimeHttpHandlerOptions,
-    Pick<DocumentHttpHandlerOptions, 'authorizeDocuments' | 'validateScene' | 'validateStage'> {}
+    Pick<DocumentHttpHandlerOptions, 'authorizeDocuments' | 'validateScene' | 'validateStage'>,
+    Pick<
+      AssetHttpHandlerOptions,
+      | 'authorizeAssets'
+      | 'renderableTypes'
+      | 'maxRequestBytes'
+      | 'maxAssetBytes'
+      | 'maxMetaBytes'
+      | 'maxParts'
+      | 'byteEgress'
+    > {
+  /** When supplied, the composed handler exposes the `/assets` contract. */
+  assetStore?: AssetStore;
+}
 
 /**
- * Compose the runtime and author-document contracts into one request handler.
- * Existing runtime routing is delegated unchanged; `/documents` is dispatched
- * to the document handler and shares the same authentication hook.
+ * Compose the runtime, optional author-document, and optional asset contracts
+ * into one request handler. Existing runtime routing is delegated unchanged;
+ * the other handlers share its authentication hook.
  */
 export function createStorageHttpHandler<
   TScene extends SceneLike = Scene,
   TStage extends Stage = Stage,
 >(
   runtimeStore: RuntimeStore,
-  documentStore: DocumentStore<TScene, TStage>,
+  documentStore: DocumentStore<TScene, TStage> | undefined,
   options: StorageHttpHandlerOptions,
 ): RequestListener {
   const runtime = createRuntimeHttpHandler(runtimeStore, options);
-  const documents = createDocumentHttpHandler(documentStore, {
-    authenticate: options.authenticate,
-    ...(options.authorizeDocuments === undefined
-      ? {}
-      : { authorizeDocuments: options.authorizeDocuments }),
-    ...(options.validateScene === undefined ? {} : { validateScene: options.validateScene }),
-    ...(options.validateStage === undefined ? {} : { validateStage: options.validateStage }),
-    ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
-  });
+  const documents =
+    documentStore === undefined
+      ? undefined
+      : createDocumentHttpHandler(documentStore, {
+          authenticate: options.authenticate,
+          ...(options.authorizeDocuments === undefined
+            ? {}
+            : { authorizeDocuments: options.authorizeDocuments }),
+          ...(options.validateScene === undefined ? {} : { validateScene: options.validateScene }),
+          ...(options.validateStage === undefined ? {} : { validateStage: options.validateStage }),
+          ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
+        });
+  const assets =
+    options.assetStore === undefined
+      ? undefined
+      : createAssetHttpHandler(options.assetStore, {
+          authenticate: async (req) =>
+            (await options.authenticate(req)) as AssetPrincipal | undefined,
+          ...(options.authorizeAssets === undefined
+            ? {}
+            : { authorizeAssets: options.authorizeAssets }),
+          ...(options.renderableTypes === undefined
+            ? {}
+            : { renderableTypes: options.renderableTypes }),
+          ...(options.maxRequestBytes === undefined
+            ? {}
+            : { maxRequestBytes: options.maxRequestBytes }),
+          ...(options.maxAssetBytes === undefined ? {} : { maxAssetBytes: options.maxAssetBytes }),
+          ...(options.maxMetaBytes === undefined ? {} : { maxMetaBytes: options.maxMetaBytes }),
+          ...(options.maxParts === undefined ? {} : { maxParts: options.maxParts }),
+          ...(options.byteEgress === undefined ? {} : { byteEgress: options.byteEgress }),
+        });
   return (req, res) => {
     let pathname: string;
     try {
@@ -722,7 +825,18 @@ export function createStorageHttpHandler<
       runtime(req, res);
       return;
     }
-    if (pathname === '/documents' || pathname.startsWith('/documents/')) documents(req, res);
-    else runtime(req, res);
+    if (
+      documents !== undefined &&
+      (pathname === '/documents' || pathname.startsWith('/documents/'))
+    ) {
+      documents(req, res);
+    } else if (
+      assets !== undefined &&
+      (pathname === '/assets' || pathname.startsWith('/assets/'))
+    ) {
+      assets(req, res);
+    } else {
+      runtime(req, res);
+    }
   };
 }

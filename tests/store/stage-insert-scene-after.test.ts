@@ -8,8 +8,11 @@ vi.mock('@/lib/utils/stage-storage', () => ({
   saveStageDataIncremental: vi.fn().mockResolvedValue(undefined),
   loadStageData: vi.fn().mockResolvedValue(null),
 }));
-vi.mock('@/lib/utils/database', () => ({
-  db: { stageOutlines: { put: vi.fn(), get: vi.fn() } },
+vi.mock('@/lib/device-storage/database', () => ({
+  db: {
+    stageOutlines: { put: vi.fn(), get: vi.fn() },
+    stageFolders: { delete: vi.fn().mockResolvedValue(undefined) },
+  },
 }));
 
 import { useStageStore } from '@/lib/store/stage';
